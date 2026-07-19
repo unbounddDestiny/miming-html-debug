@@ -87,7 +87,7 @@ jobs:
           path: |
             /opt/single-file-cli
             ~/.cache/puppeteer
-          key: singlefile-cli-${{ runner.os }}-v1
+          key: singlefile-cli-${{ runner.os }}-v2
 
       - name: Install single-file-cli and Chromium
         if: steps.cache-sf.outputs.cache-hit != 'true'
@@ -96,9 +96,12 @@ jobs:
           mkdir -p /opt/single-file-cli
           cd /opt/single-file-cli
           npm init -y >/dev/null
-          # Use ranges (not exact pins) so npm always finds a compatible published version.
-          npm install --no-audit --no-fund "single-file-cli@^1.1.0" "puppeteer@^23.0.0" >/dev/null
+          # Latest single-file-cli is 2.x. Use ^2.0.0 to pull a real published version.
+          npm install --no-audit --no-fund "single-file-cli@^2.0.0" "puppeteer@^23.0.0" >/dev/null
           npx puppeteer browsers install chrome >/dev/null 2>&1 || true
+          # Sanity check: fail fast with a clear message if the entry point is missing.
+          test -f /opt/single-file-cli/node_modules/single-file-cli/single-file-node.js \
+            || { echo "::error::single-file-node.js not found after install"; exit 1; }
 
       - name: Configure system-wide ad/tracker blocking (StevenBlack)
         run: |
@@ -128,7 +131,7 @@ jobs:
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
           )
 
-          SF="/opt/single-file-cli/node_modules/single-file-cli/single-file.js"
+          SF="/opt/single-file-cli/node_modules/single-file-cli/single-file-node.js"
 
           # Optimized check: read only the first 50KB to detect blocks/empty pages
           is_bad_response() {
