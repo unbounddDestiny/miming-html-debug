@@ -171,7 +171,7 @@ jobs:
                   --browser-headless=true \
                   --browser-executable-path="$(find ~/.cache/puppeteer -name chrome -type f 2>/dev/null | head -1 || echo chrome)" \
                   --user-agent="$UA" \
-                  --max-wait-delay=60s \
+                  --load-deferred-images-max-ttl=60000 \
                   --load-deferred-images=true \
                   --remove-hidden-elements=true \
                   --compress-css=true \
