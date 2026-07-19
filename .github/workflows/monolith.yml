@@ -1,0 +1,331 @@
+name: Archive Webpage(s) to Single-File HTML
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Multiline URLs to archive"
+        required: false
+        default: ""
+      urls_file:
+        description: "Repo file with one URL per line (used only if it exists)"
+        required: false
+        default: "urls.txt"
+      render_js:
+        description: "Pre-render with headless Chrome (for JS-heavy / SPA sites)"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      slow_site_mode:
+        description: "Enable longer timeouts for slow/unoptimized sites"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      commit_results:
+        description: "Commit the generated HTML files back to this repo"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: write
+
+jobs:
+  prep-urls:
+    runs-on: ubuntu-latest
+    outputs:
+      urls_json: ${{ steps.set-matrix.outputs.urls_json }}
+      count: ${{ steps.set-matrix.outputs.count }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Parse URLs
+        id: set-matrix
+        env:
+          URL_INPUT: ${{ inputs.url }}
+          URLS_FILE: ${{ inputs.urls_file }}
+        run: |
+          set -uo pipefail
+          : > urls_to_process.txt
+          
+          if [ -n "$URL_INPUT" ]; then
+            echo "$URL_INPUT" >> urls_to_process.txt
+          fi
+          
+          if [ -n "$URLS_FILE" ] && [ -f "$URLS_FILE" ]; then
+            cat "$URLS_FILE" >> urls_to_process.txt
+          fi
+          
+          sed -i 's/\r$//' urls_to_process.txt
+          sed -i 's/^[[:space:]]*//; s/[[:space:]]*$//' urls_to_process.txt
+          sed -i '/^[[:space:]]*$/d' urls_to_process.txt
+          awk '!seen[$0]++' urls_to_process.txt > urls_dedup.txt
+          mv urls_dedup.txt urls_to_process.txt
+          
+          COUNT=$(wc -l < urls_to_process.txt | tr -d ' ')
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          
+          JSON_ARRAY=$(jq -R -s -c 'split("\n") | map(select(length > 0))' urls_to_process.txt)
+          echo "urls_json=$(echo "$JSON_ARRAY" | base64 -w 0)" >> "$GITHUB_OUTPUT"
+
+  archive:
+    needs: prep-urls
+    runs-on: ubuntu-latest
+    if: ${{ needs.prep-urls.outputs.count != '0' && needs.prep-urls.outputs.count != '' }}
+    name: "Archive URLs Sequentially"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Decode URLs
+        id: decode
+        run: |
+          echo "${{ needs.prep-urls.outputs.urls_json }}" | base64 -d > urls.json
+          echo "urls_count=$(jq 'length' urls.json)" >> "$GITHUB_OUTPUT"
+      
+      - name: Cache Monolith Binary
+        id: cache-monolith
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/monolith
+          key: monolith-linux-${{ runner.os }}-v1
+      
+      - name: Install monolith
+        if: steps.cache-monolith.outputs.cache-hit != 'true'
+        run: |
+          set -uo pipefail
+          LATEST_URL=$(curl -s https://api.github.com/repos/Y2Z/monolith/releases/latest | jq -r '.assets[] | select(.name == "monolith-gnu-linux-x86_64") | .browser_download_url')
+          
+          if [ -n "$LATEST_URL" ] && [ "$LATEST_URL" != "null" ]; then
+            curl -fL --retry 3 --retry-delay 2 -o /usr/local/bin/monolith "$LATEST_URL"
+            chmod +x /usr/local/bin/monolith
+          else
+            cargo install monolith --locked --root /tmp/monolith-cargo
+            cp /tmp/monolith-cargo/bin/monolith /usr/local/bin/monolith
+            chmod +x /usr/local/bin/monolith
+          fi
+          
+          monolith -V
+      
+      - name: Configure system-wide ad/tracker blocking (StevenBlack)
+        run: |
+          echo "Applying StevenBlack hosts file to block ads/trackers at OS level..."
+          curl -sSL https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts | sudo tee -a /etc/hosts > /dev/null
+          echo "✅ Ad/tracker domains blocked. This will speed up loads and prevent ad-network WAF triggers."
+      
+      - name: Archive URLs Sequentially
+        id: archive
+        env:
+          RENDER_JS: ${{ inputs.render_js }}
+          SLOW_MODE: ${{ inputs.slow_site_mode }}
+        run: |
+          set -uo pipefail
+          mkdir -p snapshots
+          mapfile -t URLS < <(jq -r '.[]' urls.json)
+          TOTAL=${#URLS[@]}
+          echo "Total URLs to process: $TOTAL"
+          
+          SUCCESS_COUNT=0
+          FAIL_COUNT=0
+          
+          # Reduced baseline delay to 1s (still polite for sequential processing)
+          CURRENT_DELAY=1
+          
+          # Set timeouts based on slow_site_mode
+          if [ "$SLOW_MODE" = "true" ]; then
+            CHROME_TIMEOUT=240
+            MONOLITH_TIMEOUT=300
+            VIRTUAL_TIME_BUDGET=30000
+            echo "🐌 Slow site mode enabled: Extended timeouts (Chrome: ${CHROME_TIMEOUT}s, Monolith: ${MONOLITH_TIMEOUT}s)"
+          else
+            CHROME_TIMEOUT=180
+            MONOLITH_TIMEOUT=180
+            VIRTUAL_TIME_BUDGET=20000
+            echo "⚡ Normal mode: Standard timeouts (Chrome: ${CHROME_TIMEOUT}s, Monolith: ${MONOLITH_TIMEOUT}s)"
+          fi
+          
+          UAS=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/137.0"
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:137.0) Gecko/20100101 Firefox/137.0"
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+          )
+          
+          is_bad_response() {
+            local f="$1"
+            [ ! -s "$f" ] && return 0
+            if grep -qiE 'just a moment|attention required|checking your browser|cf-browser-verification|please verify you are a human|enable javascript and cookies to continue|ddos protection|access denied|error 403|error 429|ray id' "$f" >/dev/null 2>&1; then
+              return 0
+            fi
+            return 1
+          }
+          
+          for i in "${!URLS[@]}"; do
+            URL="${URLS[$i]}"
+            UA="${UAS[$RANDOM % ${#UAS[@]}]}"
+            output_file="snapshots/url_${i}.html"
+            
+            echo "================================================================"
+            echo "Processing [url_${i}]: $URL"
+            
+            # 1s baseline + 0-1s jitter (total 1-2s wait)
+            JITTER=$(( RANDOM % 2 ))
+            ACTUAL_DELAY=$(( CURRENT_DELAY + JITTER ))
+            echo "Waiting ${ACTUAL_DELAY}s before request..."
+            sleep "$ACTUAL_DELAY"
+            
+            SUCCESS=false
+            ATTEMPT=1
+            MAX_ATTEMPTS=5
+            TIMEOUT_MULTIPLIER=1
+            
+            while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+              echo "Attempt $ATTEMPT of $MAX_ATTEMPTS for $URL"
+              
+              # Calculate dynamic timeouts (increase on each retry)
+              CURRENT_CHROME_TIMEOUT=$(( CHROME_TIMEOUT * TIMEOUT_MULTIPLIER ))
+              CURRENT_MONO_TIMEOUT=$(( MONOLITH_TIMEOUT * TIMEOUT_MULTIPLIER ))
+              
+              # Final attempt fallback
+              if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+                echo "Final attempt: falling back to basic curl to guarantee a capture..."
+                if curl -fLs --retry 2 --retry-delay 1 -m 60 -A "$UA" "$URL" -o "$output_file" 2>/dev/null; then
+                  SUCCESS=true
+                  echo "⚠️ Captured fallback raw HTML for $URL"
+                fi
+              else
+                if [ "$RENDER_JS" = "true" ]; then
+                  dom_file=$(mktemp)
+                  
+                  # Use dynamic timeout for Chrome
+                  if timeout ${CURRENT_CHROME_TIMEOUT}s google-chrome \
+                      --headless=new \
+                      --disable-gpu \
+                      --no-sandbox \
+                      --disable-dev-shm-usage \
+                      --hide-scrollbars \
+                      --incognito \
+                      --window-size=1920,1080 \
+                      --run-all-compositor-stages-before-draw \
+                      --virtual-time-budget=${VIRTUAL_TIME_BUDGET} \
+                      --disable-background-timer-throttling \
+                      --disable-backgrounding-occluded-windows \
+                      --disable-renderer-backgrounding \
+                      --blink-settings=imagesEnabled=true \
+                      --disable-blink-features=AutomationControlled \
+                      --lang="en-US" \
+                      --user-agent="$UA" \
+                      --dump-dom "$URL" > "$dom_file" 2>/dev/null; then
+                    
+                    if ! is_bad_response "$dom_file"; then
+                      # Use dynamic timeout for monolith + skip video/audio for speed
+                      if timeout ${CURRENT_MONO_TIMEOUT}s monolith - -I -e -b "$URL" -u "$UA" \
+                          --no-video --no-audio --no-frames \
+                          -o "$output_file" < "$dom_file" 2>/dev/null; then
+                        if ! is_bad_response "$output_file"; then
+                          SUCCESS=true
+                        fi
+                      fi
+                    fi
+                  fi
+                  
+                  rm -f "$dom_file"
+                else
+                  # Use dynamic timeout for monolith + skip video/audio for speed
+                  if timeout ${CURRENT_MONO_TIMEOUT}s monolith "$URL" -I -e -u "$UA" \
+                      --no-video --no-audio --no-frames \
+                      -o "$output_file" 2>/dev/null; then
+                    if ! is_bad_response "$output_file"; then
+                      SUCCESS=true
+                    fi
+                  fi
+                fi
+              fi
+              
+              if [ "$SUCCESS" = "true" ]; then
+                echo "✅ Successfully archived $URL -> $output_file"
+                CURRENT_DELAY=1
+                break
+              else
+                echo "⚠️ Failed or blocked on attempt $ATTEMPT for $URL"
+                ATTEMPT=$((ATTEMPT + 1))
+                
+                # Increase timeout multiplier for next attempt (1.5x each retry)
+                TIMEOUT_MULTIPLIER=$(( TIMEOUT_MULTIPLIER + 1 ))
+                
+                # Exponential backoff for delays, capped at 10s
+                CURRENT_DELAY=$(( CURRENT_DELAY * 2 + 1 ))
+                [ $CURRENT_DELAY -gt 10 ] && CURRENT_DELAY=10
+                
+                if [ $ATTEMPT -le $MAX_ATTEMPTS ]; then
+                  echo "Backing off: Waiting ${CURRENT_DELAY}s before retry (timeout multiplier: ${TIMEOUT_MULTIPLIER}x)..."
+                  sleep "$CURRENT_DELAY"
+                fi
+              fi
+            done
+            
+            if [ "$SUCCESS" = "true" ]; then
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            else
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+              echo "::warning::Failed to archive after $MAX_ATTEMPTS attempts: $URL"
+            fi
+          done
+          
+          echo "archive_success_count=$SUCCESS_COUNT" >> "$GITHUB_OUTPUT"
+          echo "archive_fail_count=$FAIL_COUNT" >> "$GITHUB_OUTPUT"
+          echo "================================================================"
+          echo "ARCHIVE SUMMARY: $SUCCESS_COUNT succeeded, $FAIL_COUNT failed out of $TOTAL"
+          echo "================================================================"
+          
+          exit 0
+      
+      - name: Upload Archive Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-snapshots
+          path: snapshots/
+          retention-days: 5
+          if-no-files-found: warn
+      
+      - name: Commit and Push Changes
+        if: ${{ inputs.commit_results == 'true' }}
+        run: |
+          set -uo pipefail
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add snapshots/
+          
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          
+          git commit -m "chore: add snapshot archives [skip ci]"
+          
+          TARGET_BRANCH="${{ github.ref_name }}"
+          for attempt in 1 2 3 4 5; do
+            git fetch origin "$TARGET_BRANCH"
+            if git rebase origin/"$TARGET_BRANCH" && git push origin HEAD:"$TARGET_BRANCH"; then
+              echo "✅ Successfully pushed changes."
+              exit 0
+            else
+              echo "Push failed, attempt $attempt. Retrying..."
+              git rebase --abort || true
+            fi
+            sleep $(( 2 + RANDOM % 3 ))
+          done
+          
+          echo "::warning::Failed to push changes after 5 attempts."
+          exit 0
