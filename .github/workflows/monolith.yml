@@ -96,8 +96,8 @@ jobs:
           mkdir -p /opt/single-file-cli
           cd /opt/single-file-cli
           npm init -y >/dev/null
-          # Pin versions for reproducibility
-          npm install --no-audit --no-fund single-file-cli@1.1.66 puppeteer@23.5.0 >/dev/null
+          # Use ranges (not exact pins) so npm always finds a compatible published version.
+          npm install --no-audit --no-fund "single-file-cli@^1.1.0" "puppeteer@^23.0.0" >/dev/null
           npx puppeteer browsers install chrome >/dev/null 2>&1 || true
 
       - name: Configure system-wide ad/tracker blocking (StevenBlack)
