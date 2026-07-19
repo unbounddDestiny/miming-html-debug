@@ -10,6 +10,10 @@ on:
         description: "Repo file with one URL per line (used only if it exists)"
         required: false
         default: "urls.txt"
+      parallelism:
+        description: "Number of parallel archive jobs (shards, 1-10)"
+        required: false
+        default: "3"
       commit_results:
         description: "Commit the generated HTML files back to this repo"
         required: true
@@ -26,17 +30,18 @@ jobs:
   prep-urls:
     runs-on: ubuntu-latest
     outputs:
-      urls_json: ${{ steps.set-matrix.outputs.urls_json }}
-      count: ${{ steps.set-matrix.outputs.count }}
+      shard_json: ${{ steps.set-matrix.outputs.shard_json }}
+      shard_count: ${{ steps.set-matrix.outputs.shard_count }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Parse URLs
+      - name: Parse and shard URLs by domain
         id: set-matrix
         env:
           URL_INPUT: ${{ inputs.url }}
           URLS_FILE: ${{ inputs.urls_file }}
+          PARALLELISM: ${{ inputs.parallelism }}
         run: |
           set -uo pipefail
           : > urls_to_process.txt
@@ -54,26 +59,62 @@ jobs:
           awk '!seen[$0]++' urls_to_process.txt > urls_dedup.txt
           mv urls_dedup.txt urls_to_process.txt
 
-          COUNT=$(wc -l < urls_to_process.txt | tr -d ' ')
-          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          TOTAL=$(wc -l < urls_to_process.txt | tr -d ' ')
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "shard_json=[]" >> "$GITHUB_OUTPUT"
+            echo "shard_count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-          JSON_ARRAY=$(jq -R -s -c 'split("\n") | map(select(length > 0))' urls_to_process.txt)
-          echo "urls_json=$(echo "$JSON_ARRAY" | base64 -w 0)" >> "$GITHUB_OUTPUT"
+          # Sanitize parallelism input and keep it within sane bounds.
+          P="${PARALLELISM:-3}"
+          case "$P" in (''|*[!0-9]*) P=3 ;; esac
+          [ "$P" -lt 1 ] && P=1
+          [ "$P" -gt "$TOTAL" ] && P=$TOTAL
+          [ "$P" -gt 10 ] && P=10   # cap: this is about throughput, not scale-evasion
+
+          mkdir -p shards
+          # Group by domain so every URL for a given host lands in the same shard.
+          # Keeps the per-request delay/backoff meaningful instead of letting
+          # several shards hit the same site at the same moment.
+          while IFS= read -r url; do
+            domain=$(printf '%s' "$url" | sed -E 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||; s|[/?#].*||; s/:.*//')
+            shard=$(( $(printf '%s' "$domain" | cksum | cut -d' ' -f1) % P ))
+            echo "$url" >> "shards/shard_${shard}.txt"
+          done < urls_to_process.txt
+
+          ACTIVE_SHARDS="[]"
+          for i in $(seq 0 $((P - 1))); do
+            if [ -s "shards/shard_${i}.txt" ]; then
+              ACTIVE_SHARDS=$(echo "$ACTIVE_SHARDS" | jq -c ". + [$i]")
+            fi
+          done
+
+          echo "shard_json=$ACTIVE_SHARDS" >> "$GITHUB_OUTPUT"
+          echo "shard_count=$(echo "$ACTIVE_SHARDS" | jq 'length')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload sharded URL lists
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-inputs
+          path: shards/
+          retention-days: 1
 
   archive:
     needs: prep-urls
+    if: ${{ needs.prep-urls.outputs.shard_count != '0' }}
     runs-on: ubuntu-latest
-    if: ${{ needs.prep-urls.outputs.count != '0' && needs.prep-urls.outputs.count != '' }}
-    name: "Archive URLs Sequentially"
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.prep-urls.outputs.shard_json) }}
+    name: "Archive shard ${{ matrix.shard }}"
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Decode URLs
-        id: decode
-        run: |
-          echo "${{ needs.prep-urls.outputs.urls_json }}" | base64 -d > urls.json
-          echo "urls_count=$(jq 'length' urls.json)" >> "$GITHUB_OUTPUT"
+      - name: Download sharded URL list
+        uses: actions/download-artifact@v4
+        with:
+          name: shard-inputs
+          path: shards
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -87,7 +128,7 @@ jobs:
           path: |
             /opt/single-file-cli
             ~/.cache/puppeteer
-          key: singlefile-cli-${{ runner.os }}-v2
+          key: singlefile-cli-${{ runner.os }}-v3
 
       - name: Install single-file-cli and Chromium
         if: steps.cache-sf.outputs.cache-hit != 'true'
@@ -96,12 +137,12 @@ jobs:
           mkdir -p /opt/single-file-cli
           cd /opt/single-file-cli
           npm init -y >/dev/null
-          # Latest single-file-cli is 2.x. Use ^2.0.0 to pull a real published version.
           npm install --no-audit --no-fund "single-file-cli@^2.0.0" "puppeteer@^23.0.0" >/dev/null
           npx puppeteer browsers install chrome >/dev/null 2>&1 || true
-          # Sanity check: fail fast with a clear message if the entry point is missing.
-          test -f /opt/single-file-cli/node_modules/single-file-cli/single-file-node.js \
-            || { echo "::error::single-file-node.js not found after install"; exit 1; }
+          # single-file-cli publishes its binary at node_modules/.bin/single-file -
+          # the old node_modules/single-file-cli/single-file-node.js path doesn't exist.
+          test -f /opt/single-file-cli/node_modules/.bin/single-file \
+            || { echo "::error::single-file binary not found after install"; exit 1; }
 
       - name: Configure system-wide ad/tracker blocking (StevenBlack)
         run: |
@@ -109,20 +150,22 @@ jobs:
           curl -sSL https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts | sudo tee -a /etc/hosts > /dev/null
           echo "Ad/tracker domains blocked."
 
-      - name: Archive URLs Sequentially
+      - name: Archive this shard's URLs
         id: archive
         run: |
           set -uo pipefail
           mkdir -p snapshots
-          mapfile -t URLS < <(jq -r '.[]' urls.json)
+          SHARD_FILE="shards/shard_${{ matrix.shard }}.txt"
+          mapfile -t URLS < "$SHARD_FILE"
           TOTAL=${#URLS[@]}
-          echo "Total URLs to process: $TOTAL"
+          echo "Shard ${{ matrix.shard }}: $TOTAL URL(s)"
 
           SUCCESS_COUNT=0
           FAIL_COUNT=0
-          # Polite baseline delay + jitter — prioritize stability over speed.
+          # Polite baseline delay + jitter - prioritize stability over speed.
           BASE_DELAY=5
 
+          # Ordinary desktop browser strings only.
           UAS=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
@@ -131,7 +174,8 @@ jobs:
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
           )
 
-          SF="/opt/single-file-cli/node_modules/single-file-cli/single-file-node.js"
+          SF="/opt/single-file-cli/node_modules/.bin/single-file"
+          CHROME_PATH="$(find ~/.cache/puppeteer -name chrome -type f 2>/dev/null | head -1)"
 
           # Optimized check: read only the first 50KB to detect blocks/empty pages
           is_bad_response() {
@@ -146,10 +190,11 @@ jobs:
           for i in "${!URLS[@]}"; do
             URL="${URLS[$i]}"
             UA="${UAS[$(( RANDOM % ${#UAS[@]} ))]}"
-            output_file="snapshots/url_${i}.html"
+            SAFE_NAME=$(printf '%s' "$URL" | md5sum | cut -d' ' -f1)
+            output_file="snapshots/${SAFE_NAME}.html"
 
             echo "================================================================"
-            echo "Processing [url_${i}]: $URL"
+            echo "Processing: $URL"
 
             JITTER=$(( RANDOM % 4 ))
             ACTUAL_DELAY=$(( BASE_DELAY + JITTER ))
@@ -164,28 +209,24 @@ jobs:
             while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
               echo "Attempt $ATTEMPT of $MAX_ATTEMPTS for $URL"
 
-              # single-file-cli runs a real headless Chromium and saves one self-contained HTML.
-              # One tool replaces the old "chrome --dump-dom | monolith" two-step pipeline,
-              # which was the main source of failures on JS/Cloudflare-protected pages.
-              if timeout 180s node "$SF" \
+              if timeout 180s "$SF" \
                   --browser-headless=true \
-                  --browser-executable-path="$(find ~/.cache/puppeteer -name chrome -type f 2>/dev/null | head -1 || echo chrome)" \
+                  --browser-executable-path="${CHROME_PATH:-chrome}" \
                   --user-agent="$UA" \
                   --load-deferred-images=true \
                   --remove-hidden-elements=true \
                   --compress-css=true \
-                  --output-directory="snapshots" \
-                  "$URL" "url_${i}.html" 2> "/tmp/sf_err_${i}.log"; then
+                  "$URL" "$output_file" 2> "/tmp/sf_err.log"; then
 
                 if [ -s "$output_file" ] && ! is_bad_response "$output_file"; then
                   SUCCESS=true
                 else
                   echo "single-file produced a bad/empty result; will retry."
-                  [ -f "/tmp/sf_err_${i}.log" ] && tail -n 20 "/tmp/sf_err_${i}.log"
+                  tail -n 20 "/tmp/sf_err.log" || true
                 fi
               else
                 echo "single-file exited non-zero / timed out."
-                [ -f "/tmp/sf_err_${i}.log" ] && tail -n 20 "/tmp/sf_err_${i}.log"
+                tail -n 20 "/tmp/sf_err.log" || true
               fi
 
               if [ "$SUCCESS" = "true" ]; then
@@ -194,7 +235,6 @@ jobs:
                 break
               else
                 ATTEMPT=$((ATTEMPT + 1))
-                # Exponential-ish backoff capped at 30s — stability over speed.
                 CURRENT_DELAY=$(( CURRENT_DELAY * 2 ))
                 [ $CURRENT_DELAY -gt 30 ] && CURRENT_DELAY=30
                 if [ $ATTEMPT -le $MAX_ATTEMPTS ]; then
@@ -210,27 +250,40 @@ jobs:
               FAIL_COUNT=$((FAIL_COUNT + 1))
               echo "::warning::Failed to archive after $MAX_ATTEMPTS attempts: $URL"
             fi
-            rm -f "/tmp/sf_err_${i}.log"
           done
 
           echo "archive_success_count=$SUCCESS_COUNT" >> "$GITHUB_OUTPUT"
           echo "archive_fail_count=$FAIL_COUNT" >> "$GITHUB_OUTPUT"
           echo "================================================================"
-          echo "ARCHIVE SUMMARY: $SUCCESS_COUNT succeeded, $FAIL_COUNT failed out of $TOTAL"
+          echo "SHARD ${{ matrix.shard }} SUMMARY: $SUCCESS_COUNT succeeded, $FAIL_COUNT failed out of $TOTAL"
           echo "================================================================"
           exit 0
 
-      - name: Upload Archive Artifacts
+      - name: Upload this shard's snapshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: all-snapshots
+          name: snapshots-shard-${{ matrix.shard }}
           path: snapshots/
           retention-days: 5
           if-no-files-found: warn
 
+  commit:
+    needs: archive
+    if: ${{ always() && needs.archive.result != 'skipped' && inputs.commit_results == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all snapshot shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: snapshots-shard-*
+          path: snapshots
+          merge-multiple: true
+
       - name: Commit and Push Changes
-        if: ${{ inputs.commit_results == 'true' }}
         run: |
           set -uo pipefail
           git config --global user.name "github-actions[bot]"
