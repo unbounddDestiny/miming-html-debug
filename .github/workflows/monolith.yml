@@ -10,14 +10,6 @@ on:
         description: "Repo file with one URL per line (used only if it exists)"
         required: false
         default: "urls.txt"
-      render_js:
-        description: "Pre-render with headless Chrome (for JS-heavy / SPA sites)"
-        required: true
-        default: "true"
-        type: choice
-        options:
-          - "false"
-          - "true"
       commit_results:
         description: "Commit the generated HTML files back to this repo"
         required: true
@@ -54,17 +46,17 @@ jobs:
           if [ -n "$URLS_FILE" ] && [ -f "$URLS_FILE" ]; then
             cat "$URLS_FILE" >> urls_to_process.txt
           fi
-          
+
           # Clean and deduplicate
           sed -i 's/\r$//' urls_to_process.txt
           sed -i 's/^[[:space:]]*//; s/[[:space:]]*$//' urls_to_process.txt
           sed -i '/^[[:space:]]*$/d' urls_to_process.txt
           awk '!seen[$0]++' urls_to_process.txt > urls_dedup.txt
           mv urls_dedup.txt urls_to_process.txt
-          
+
           COUNT=$(wc -l < urls_to_process.txt | tr -d ' ')
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
-          
+
           JSON_ARRAY=$(jq -R -s -c 'split("\n") | map(select(length > 0))' urls_to_process.txt)
           echo "urls_json=$(echo "$JSON_ARRAY" | base64 -w 0)" >> "$GITHUB_OUTPUT"
 
@@ -83,51 +75,51 @@ jobs:
           echo "${{ needs.prep-urls.outputs.urls_json }}" | base64 -d > urls.json
           echo "urls_count=$(jq 'length' urls.json)" >> "$GITHUB_OUTPUT"
 
-      - name: Cache Monolith Binary
-        id: cache-monolith
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Cache single-file-cli install
+        id: cache-sf
         uses: actions/cache@v4
         with:
-          path: /usr/local/bin/monolith
-          key: monolith-linux-${{ runner.os }}-v1
+          path: |
+            /opt/single-file-cli
+            ~/.cache/puppeteer
+          key: singlefile-cli-${{ runner.os }}-v1
 
-      - name: Install monolith
-        if: steps.cache-monolith.outputs.cache-hit != 'true'
+      - name: Install single-file-cli and Chromium
+        if: steps.cache-sf.outputs.cache-hit != 'true'
         run: |
           set -uo pipefail
-          LATEST_URL=$(curl -s https://api.github.com/repos/Y2Z/monolith/releases/latest | jq -r '.assets[] | select(.name == "monolith-gnu-linux-x86_64") | .browser_download_url')
-          if [ -n "$LATEST_URL" ] && [ "$LATEST_URL" != "null" ]; then
-            curl -fL --retry 3 --retry-delay 2 -o /usr/local/bin/monolith "$LATEST_URL"
-            chmod +x /usr/local/bin/monolith
-          else
-            cargo install monolith --locked --root /tmp/monolith-cargo
-            cp /tmp/monolith-cargo/bin/monolith /usr/local/bin/monolith
-            chmod +x /usr/local/bin/monolith
-          fi
-          monolith -V
+          mkdir -p /opt/single-file-cli
+          cd /opt/single-file-cli
+          npm init -y >/dev/null
+          # Pin versions for reproducibility
+          npm install --no-audit --no-fund single-file-cli@1.1.66 puppeteer@23.5.0 >/dev/null
+          npx puppeteer browsers install chrome >/dev/null 2>&1 || true
 
       - name: Configure system-wide ad/tracker blocking (StevenBlack)
         run: |
           echo "Applying StevenBlack hosts file to block ads/trackers at OS level..."
           curl -sSL https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts | sudo tee -a /etc/hosts > /dev/null
-          echo "✅ Ad/tracker domains blocked. This speeds up loads and prevents ad-network WAF triggers."
+          echo "Ad/tracker domains blocked."
 
       - name: Archive URLs Sequentially
         id: archive
-        env:
-          RENDER_JS: ${{ inputs.render_js }}
         run: |
           set -uo pipefail
           mkdir -p snapshots
           mapfile -t URLS < <(jq -r '.[]' urls.json)
           TOTAL=${#URLS[@]}
           echo "Total URLs to process: $TOTAL"
-          
+
           SUCCESS_COUNT=0
           FAIL_COUNT=0
-          
-          # Polite baseline delay (2s) + jitter to strictly avoid Layer 7 DDoS triggers
-          CURRENT_DELAY=2 
-          
+          # Polite baseline delay + jitter — prioritize stability over speed.
+          BASE_DELAY=5
+
           UAS=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
@@ -136,11 +128,13 @@ jobs:
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
           )
 
-          # Optimized check: Only reads first 50KB to prevent slowdowns on massive HTML files
+          SF="/opt/single-file-cli/node_modules/single-file-cli/single-file.js"
+
+          # Optimized check: read only the first 50KB to detect blocks/empty pages
           is_bad_response() {
             local f="$1"
-            [ ! -s "$f" ] && return 0 
-            if head -c 50000 "$f" | grep -qiE 'just a moment|attention required|checking your browser|cf-browser-verification|please verify you are a human|enable javascript and cookies to continue|ddos protection|access denied|error 403|error 429|ray id' >/dev/null 2>&1; then
+            [ ! -s "$f" ] && return 0
+            if head -c 50000 "$f" | grep -qiE 'just a moment|attention required|checking your browser|cf-browser-verification|please verify you are a human|enable javascript and cookies to continue|ddos protection|access denied|error 403|error 429|ray id|captcha' >/dev/null 2>&1; then
               return 0
             fi
             return 1
@@ -148,86 +142,59 @@ jobs:
 
           for i in "${!URLS[@]}"; do
             URL="${URLS[$i]}"
-            UA="${UAS[$RANDOM % ${#UAS[@]}]}"
+            UA="${UAS[$(( RANDOM % ${#UAS[@]} ))]}"
             output_file="snapshots/url_${i}.html"
-            
+
             echo "================================================================"
             echo "Processing [url_${i}]: $URL"
-            
-            JITTER=$(( RANDOM % 2 ))
-            ACTUAL_DELAY=$(( CURRENT_DELAY + JITTER ))
+
+            JITTER=$(( RANDOM % 4 ))
+            ACTUAL_DELAY=$(( BASE_DELAY + JITTER ))
             echo "Waiting ${ACTUAL_DELAY}s before request..."
             sleep "$ACTUAL_DELAY"
-            
+
             SUCCESS=false
             ATTEMPT=1
-            MAX_ATTEMPTS=4 # Reduced to 4 to fail faster on dead links
+            MAX_ATTEMPTS=5
+            CURRENT_DELAY=$BASE_DELAY
 
             while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
               echo "Attempt $ATTEMPT of $MAX_ATTEMPTS for $URL"
-              
-              # Final attempt fallback
-              if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
-                echo "Final attempt: falling back to basic curl..."
-                if curl -fLs --compressed --retry 2 --retry-delay 1 -m 30 -A "$UA" "$URL" -o "$output_file" 2>/dev/null; then
+
+              # single-file-cli runs a real headless Chromium and saves one self-contained HTML.
+              # One tool replaces the old "chrome --dump-dom | monolith" two-step pipeline,
+              # which was the main source of failures on JS/Cloudflare-protected pages.
+              if timeout 180s node "$SF" \
+                  --browser-headless=true \
+                  --browser-executable-path="$(find ~/.cache/puppeteer -name chrome -type f 2>/dev/null | head -1 || echo chrome)" \
+                  --user-agent="$UA" \
+                  --max-wait-delay=60s \
+                  --load-deferred-images=true \
+                  --remove-hidden-elements=true \
+                  --compress-css=true \
+                  --output-directory="snapshots" \
+                  "$URL" "url_${i}.html" 2> "/tmp/sf_err_${i}.log"; then
+
+                if [ -s "$output_file" ] && ! is_bad_response "$output_file"; then
                   SUCCESS=true
-                  echo "⚠️ Captured fallback raw HTML for $URL"
+                else
+                  echo "single-file produced a bad/empty result; will retry."
+                  [ -f "/tmp/sf_err_${i}.log" ] && tail -n 20 "/tmp/sf_err_${i}.log"
                 fi
               else
-                if [ "$RENDER_JS" = "true" ]; then
-                  dom_file=$(mktemp)
-                  # Optimized Chrome flags for speed and lower memory footprint
-                  if timeout 90s google-chrome \
-                      --headless=new \
-                      --disable-gpu \
-                      --no-sandbox \
-                      --disable-dev-shm-usage \
-                      --hide-scrollbars \
-                      --incognito \
-                      --window-size=1920,1080 \
-                      --run-all-compositor-stages-before-draw \
-                      --virtual-time-budget=10000 \
-                      --disable-background-timer-throttling \
-                      --disable-backgrounding-occluded-windows \
-                      --disable-renderer-backgrounding \
-                      --disable-features=TranslateUI,IsolateOrigins,site-per-process \
-                      --blink-settings=imagesEnabled=true \
-                      --disable-blink-features=AutomationControlled \
-                      --lang="en-US" \
-                      --user-agent="$UA" \
-                      --dump-dom "$URL" > "$dom_file" 2>/dev/null; then
-                    
-                    if ! is_bad_response "$dom_file"; then
-                      # REMOVED -I (no images) and -e (no css) to ensure all assets are embedded
-                      if timeout 60s monolith - -b "$URL" -u "$UA" -o "$output_file" < "$dom_file" 2>/dev/null; then
-                        if ! is_bad_response "$output_file"; then
-                          SUCCESS=true
-                        fi
-                      fi
-                    fi
-                  fi
-                  rm -f "$dom_file"
-                else
-                  # REMOVED -I and -e here as well
-                  if timeout 60s monolith "$URL" -u "$UA" -o "$output_file" 2>/dev/null; then
-                    if ! is_bad_response "$output_file"; then
-                      SUCCESS=true
-                    fi
-                  fi
-                fi
+                echo "single-file exited non-zero / timed out."
+                [ -f "/tmp/sf_err_${i}.log" ] && tail -n 20 "/tmp/sf_err_${i}.log"
               fi
 
               if [ "$SUCCESS" = "true" ]; then
-                echo "✅ Successfully archived $URL -> $output_file"
-                CURRENT_DELAY=2 # Reset to baseline on success
+                echo "Successfully archived $URL -> $output_file"
+                CURRENT_DELAY=$BASE_DELAY
                 break
               else
-                echo "⚠️ Failed or blocked on attempt $ATTEMPT for $URL"
                 ATTEMPT=$((ATTEMPT + 1))
-                # Exponential backoff capped at 12s
-                CURRENT_DELAY=$(( CURRENT_DELAY + 2 ))
-                [ $CURRENT_DELAY -gt 12 ] && CURRENT_DELAY=12 
-                
+                # Exponential-ish backoff capped at 30s — stability over speed.
+                CURRENT_DELAY=$(( CURRENT_DELAY * 2 ))
+                [ $CURRENT_DELAY -gt 30 ] && CURRENT_DELAY=30
                 if [ $ATTEMPT -le $MAX_ATTEMPTS ]; then
                   echo "Backing off: Waiting ${CURRENT_DELAY}s before retry..."
                   sleep "$CURRENT_DELAY"
@@ -241,6 +208,7 @@ jobs:
               FAIL_COUNT=$((FAIL_COUNT + 1))
               echo "::warning::Failed to archive after $MAX_ATTEMPTS attempts: $URL"
             fi
+            rm -f "/tmp/sf_err_${i}.log"
           done
 
           echo "archive_success_count=$SUCCESS_COUNT" >> "$GITHUB_OUTPUT"
@@ -275,7 +243,7 @@ jobs:
           for attempt in 1 2 3; do
             git fetch origin "$TARGET_BRANCH"
             if git rebase origin/"$TARGET_BRANCH" && git push origin HEAD:"$TARGET_BRANCH"; then
-              echo "✅ Successfully pushed changes."
+              echo "Successfully pushed changes."
               exit 0
             else
               echo "Push failed, attempt $attempt. Retrying..."
