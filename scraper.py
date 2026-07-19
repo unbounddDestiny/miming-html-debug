@@ -5,7 +5,16 @@ Manga Chapter Scraper
 Uses a real Chromium browser (via Playwright) to bypass DDoS / bot-detection
 protections (Cloudflare, etc.) and downloads manga chapter images in order.
 
-Output: one folder per chapter containing numbered .jpg images + a combined PDF.
+Output: one folder per chapter containing numbered images + a combined PDF.
+
+Speed design
+------------
+  • Bot-detection only lives on the *reader page* — we keep human-like delays
+    there (scroll pauses, networkidle wait, settle time).
+  • Image files are served from a CDN with no bot protection, so we download
+    them in parallel (DOWNLOAD_CONCURRENCY at once) with no inter-image delay.
+  • Multiple chapters are processed with limited concurrency (CHAPTER_CONCURRENCY)
+    using separate browser contexts so sites can't correlate sessions.
 
 Usage:
     python3 scraper.py                    # scrape all URLs in urls.txt
@@ -17,7 +26,6 @@ import sys
 import re
 import time
 import random
-import shutil
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -31,30 +39,36 @@ import img2pdf
 URLS_FILE = "urls.txt"
 OUTPUT_DIR = Path("downloads")
 
-# How long to wait for page to fully settle (ms)
-PAGE_LOAD_TIMEOUT = 60_000
-# Extra wait after load so lazy-loaded images can appear (seconds)
-SETTLE_WAIT = 4
-# Delay between requests to avoid rate-limiting (seconds)
-REQUEST_DELAY = (2.0, 4.5)
-# Retries per image download
-IMAGE_RETRIES = 3
+# Playwright page-load config (where bot detection actually lives)
+PAGE_LOAD_TIMEOUT = 60_000        # ms
+SETTLE_WAIT      = 4              # seconds after scrolling before reading DOM
+SCROLL_STEPS     = 5
+SCROLL_PAUSE     = 0.6            # seconds between scroll steps
 
-# Realistic browser headers
-EXTRA_HEADERS = {
-    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+# Image download config (CDN — no bot detection, safe to parallelise)
+DOWNLOAD_CONCURRENCY = 5          # simultaneous image downloads per chapter
+IMAGE_RETRIES        = 3          # retries per image on failure
+IMAGE_TIMEOUT        = 30         # seconds per request
+RETRY_DELAY          = (1.0, 2.0) # back-off between retries (seconds)
+
+# Chapter-level concurrency (separate browser contexts per chapter)
+CHAPTER_CONCURRENCY  = 2          # chapters scraped in parallel
+INTER_CHAPTER_DELAY  = (2.0, 4.0) # seconds between chapter *starts*
+
+# Realistic browser headers for image requests
+IMG_HEADERS = {
+    "Accept":          "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
-    "DNT": "1",
-    "Sec-Fetch-Dest": "image",
-    "Sec-Fetch-Mode": "no-cors",
-    "Sec-Fetch-Site": "same-origin",
+    "DNT":             "1",
+    "Sec-Fetch-Dest":  "image",
+    "Sec-Fetch-Mode":  "no-cors",
+    "Sec-Fetch-Site":  "same-origin",
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def slugify(text: str) -> str:
-    """Turn a URL / title into a safe folder name."""
     text = re.sub(r"https?://[^/]+", "", text)
     text = re.sub(r"[^a-zA-Z0-9]+", "_", text).strip("_")
     return text[:120]
@@ -62,23 +76,19 @@ def slugify(text: str) -> str:
 
 def chapter_dir(url: str) -> Path:
     parsed = urlparse(url)
-    # e.g. /manga/super-gold-system/chapter-2  →  super-gold-system_chapter-2
-    slug = slugify(parsed.netloc + parsed.path)
-    d = OUTPUT_DIR / slug
+    slug   = slugify(parsed.netloc + parsed.path)
+    d      = OUTPUT_DIR / slug
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def human_delay(lo: float = None, hi: float = None) -> None:
-    lo = lo or REQUEST_DELAY[0]
-    hi = hi or REQUEST_DELAY[1]
+def jitter(lo: float, hi: float) -> None:
     time.sleep(random.uniform(lo, hi))
 
 
-# ── Image selectors (ordered by specificity / likelihood) ────────────────────
+# ── Image selectors (specificity order) ──────────────────────────────────────
 
 IMAGE_SELECTORS = [
-    # Common manga readers
     ".reading-content img",
     ".chapter-content img",
     ".manga-reader img",
@@ -89,216 +99,235 @@ IMAGE_SELECTORS = [
     ".reader-area img",
     ".viewer img",
     ".pages img",
-    # Vortex / generic
     "div.container img",
     "main img",
-    # Fallback — every img on the page
     "img",
 ]
 
 
 async def find_images(page) -> list[str]:
-    """Try each selector until we get a non-trivial list of manga page img URLs.
+    """Return ordered, de-duplicated list of manga-page image URLs.
 
-    Filters out small images (icons, buttons, UI) by checking naturalWidth /
-    naturalHeight rendered in the browser — anything under 300 px wide is
-    almost certainly not a manga page.
+    Dimension filtering only fires when the image has *actually loaded*
+    (naturalWidth > 0). Lazy-loaded placeholders have naturalWidth=0 but a
+    tiny CSS height (e.g. 16 px) — using i.height instead of naturalHeight
+    would incorrectly discard every manga page on sites like ManhuaPlus.
     """
-    MIN_WIDTH = 300   # pixels — manga pages are always wider than this
-    MIN_HEIGHT = 200  # pixels
+    MIN_W, MIN_H = 300, 200
 
     for selector in IMAGE_SELECTORS:
         candidates = await page.evaluate(
             """([sel, minW, minH]) => {
                 const imgs = Array.from(document.querySelectorAll(sel));
-                const results = [];
+                const out  = [];
                 for (const i of imgs) {
                     const src = i.dataset.src || i.dataset.lazySrc
                                 || i.dataset.original || i.getAttribute('src') || '';
                     if (!src || src.startsWith('data:') || src.length < 10) continue;
-                    // Must look like an image file
                     if (!/\\.(jpg|jpeg|png|webp)(\\?.*)?$/i.test(src)) continue;
-                    // Dimension check — skip tiny icons / UI elements
-                    const w = i.naturalWidth  || i.width  || 0;
-                    const h = i.naturalHeight || i.height || 0;
-                    if (w > 0 && w < minW) continue;
-                    if (h > 0 && h < minH) continue;
-                    results.push(src);
+                    // Only apply size filter when the browser has actually loaded
+                    // the image (naturalWidth > 0). Unloaded lazy images report
+                    // naturalWidth=0 — we must keep those; the URL regex above
+                    // already weeds out obvious non-image assets.
+                    const nw = i.naturalWidth;
+                    const nh = i.naturalHeight;
+                    if (nw > 0 && nw < minW) continue;
+                    if (nh > 0 && nh < minH) continue;
+                    out.push(src);
                 }
-                // De-duplicate while preserving order
-                return [...new Set(results)];
+                return [...new Set(out)];
             }""",
-            [selector, MIN_WIDTH, MIN_HEIGHT],
+            [selector, MIN_W, MIN_H],
         )
-
         if len(candidates) >= 2:
-            print(f"  Found {len(candidates)} images with selector: {selector!r}")
+            print(f"  Found {len(candidates)} images ({selector!r})")
             return candidates
 
     return []
 
 
-# ── Downloader ────────────────────────────────────────────────────────────────
+# ── Image downloader (runs in a thread pool) ──────────────────────────────────
 
-def download_image(url: str, dest: Path, session: requests.Session, referer: str) -> bool:
-    """Download a single image with retries. Returns True on success."""
-    headers = {**EXTRA_HEADERS, "Referer": referer}
+def _download_blocking(url: str, dest: Path, session: requests.Session,
+                       referer: str) -> bool:
+    """Blocking download with retries. Called via asyncio.to_thread."""
+    headers = {**IMG_HEADERS, "Referer": referer}
     for attempt in range(1, IMAGE_RETRIES + 1):
         try:
-            resp = session.get(url, headers=headers, timeout=30, stream=True)
+            resp = session.get(url, headers=headers,
+                               timeout=IMAGE_TIMEOUT, stream=True)
             resp.raise_for_status()
             with open(dest, "wb") as f:
                 for chunk in resp.iter_content(8192):
                     f.write(chunk)
-            # Validate the image
             with Image.open(dest) as img:
                 img.verify()
             return True
-        except Exception as e:
-            print(f"    Attempt {attempt}/{IMAGE_RETRIES} failed for {url}: {e}")
+        except Exception as exc:
+            print(f"    [{dest.name}] attempt {attempt}/{IMAGE_RETRIES} failed: {exc}")
             if dest.exists():
                 dest.unlink()
             if attempt < IMAGE_RETRIES:
-                human_delay(1.5, 3.0)
+                jitter(*RETRY_DELAY)
     return False
 
 
-def build_pdf(chapter_path: Path) -> Path:
-    """Combine all downloaded images into a single PDF preserving order."""
-    images = sorted(chapter_path.glob("*.jpg")) + sorted(chapter_path.glob("*.png")) + \
-             sorted(chapter_path.glob("*.webp"))
-    # re-sort numerically
-    images = sorted(set(images), key=lambda p: int(re.search(r"(\d+)", p.stem).group(1))
-                    if re.search(r"(\d+)", p.stem) else 0)
+async def download_image(url: str, dest: Path, session: requests.Session,
+                         referer: str, sem: asyncio.Semaphore) -> bool:
+    """Async wrapper — acquires semaphore then runs blocking download in thread."""
+    async with sem:
+        return await asyncio.to_thread(_download_blocking, url, dest, session, referer)
 
+
+# ── PDF builder ───────────────────────────────────────────────────────────────
+
+def build_pdf(chapter_path: Path) -> Path | None:
+    images = sorted(
+        set(chapter_path.glob("*.jpg")) |
+        set(chapter_path.glob("*.png")) |
+        set(chapter_path.glob("*.webp")),
+        key=lambda p: int(m.group(1)) if (m := re.search(r"(\d+)", p.stem)) else 0,
+    )
     if not images:
         print("  No images to bundle into PDF.")
         return None
 
-    # Convert webp → jpg for img2pdf compatibility
     converted = []
-    for img_path in images:
-        if img_path.suffix.lower() == ".webp":
-            jpg_path = img_path.with_suffix(".jpg")
-            with Image.open(img_path) as im:
-                im.convert("RGB").save(jpg_path, "JPEG", quality=95)
-            converted.append(jpg_path)
+    for p in images:
+        if p.suffix.lower() == ".webp":
+            jpg = p.with_suffix(".jpg")
+            with Image.open(p) as im:
+                im.convert("RGB").save(jpg, "JPEG", quality=95)
+            converted.append(jpg)
         else:
-            converted.append(img_path)
+            converted.append(p)
 
     pdf_path = chapter_path / "chapter.pdf"
     with open(pdf_path, "wb") as f:
         f.write(img2pdf.convert([str(p) for p in converted]))
 
-    print(f"  PDF saved: {pdf_path} ({len(converted)} pages)")
+    print(f"  PDF saved → {pdf_path}  ({len(converted)} pages)")
     return pdf_path
 
 
 # ── Core scraper ──────────────────────────────────────────────────────────────
 
-async def scrape_chapter(url: str, browser) -> bool:
-    out_dir = chapter_dir(url)
-    print(f"\n{'─'*60}")
-    print(f"Chapter URL : {url}")
-    print(f"Output dir  : {out_dir}")
+async def scrape_chapter(url: str, browser,
+                         start_delay: float = 0.0) -> bool:
+    """Scrape one chapter. start_delay staggers parallel chapter starts."""
+    if start_delay:
+        await asyncio.sleep(start_delay)
 
+    out_dir = chapter_dir(url)
+    tag     = urlparse(url).path.split("/")[-2] or urlparse(url).path.rstrip("/").split("/")[-1]
+    prefix  = f"[{tag}]"
+
+    print(f"\n{'─'*60}\n{prefix} {url}\n       → {out_dir}")
+
+    # Each chapter gets its own browser context so cookies/fingerprints are isolated
     context = await browser.new_context(
-        viewport={"width": 1366, "height": 900},
-        user_agent=(
+        viewport    = {"width": 1366, "height": 900},
+        user_agent  = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/126.0.0.0 Safari/537.36"
         ),
-        locale="en-US",
-        timezone_id="America/New_York",
-        # Don't reveal we're headless
-        java_script_enabled=True,
+        locale      = "en-US",
+        timezone_id = "America/New_York",
     )
-
-    # Mask automation signals
     await context.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+        Object.defineProperty(navigator, 'plugins',   { get: () => [1,2,3,4,5] });
         window.chrome = { runtime: {} };
     """)
-
     page = await context.new_page()
 
     try:
-        print("  Loading page …")
-        await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
-
-        # Wait for network to quiet down + any lazy loaders
+        # ── Page load (bot-detection zone — keep delays here) ─────────────
+        print(f"{prefix} Loading page …")
+        await page.goto(url, wait_until="domcontentloaded",
+                        timeout=PAGE_LOAD_TIMEOUT)
         try:
             await page.wait_for_load_state("networkidle", timeout=20_000)
         except PWTimeout:
-            pass  # networkidle timed out — continue anyway
+            pass  # continue anyway
 
-        # Scroll to trigger lazy-load
-        print("  Scrolling to trigger lazy-load …")
-        for _ in range(5):
+        print(f"{prefix} Scrolling to trigger lazy-load …")
+        for _ in range(SCROLL_STEPS):
             await page.evaluate("window.scrollBy(0, window.innerHeight)")
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(SCROLL_PAUSE)
         await page.evaluate("window.scrollTo(0, 0)")
         await asyncio.sleep(SETTLE_WAIT)
 
+        # ── Find image URLs ────────────────────────────────────────────────
         image_urls = await find_images(page)
         if not image_urls:
-            print("  ✗ No chapter images found — the page structure may be unusual.")
-            print("  Saving a screenshot for manual inspection …")
-            await page.screenshot(path=str(out_dir / "debug_screenshot.png"), full_page=True)
+            print(f"{prefix} ✗ No images found — saving debug screenshot.")
+            await page.screenshot(path=str(out_dir / "debug_screenshot.png"),
+                                  full_page=True)
             return False
 
-        # Grab cookies from the browser context and feed them into requests
+        # Pass browser cookies into the requests session so CDN auth works
         cookies = await context.cookies()
         session = requests.Session()
         for c in cookies:
-            session.cookies.set(c["name"], c["value"], domain=c.get("domain", ""))
-
-        print(f"  Downloading {len(image_urls)} images …")
-        ok_count = 0
-        for idx, img_url in enumerate(image_urls, start=1):
-            # Handle relative URLs
-            if img_url.startswith("//"):
-                img_url = "https:" + img_url
-            elif img_url.startswith("/"):
-                parsed = urlparse(url)
-                img_url = f"{parsed.scheme}://{parsed.netloc}{img_url}"
-
-            ext = re.search(r"\.(jpg|jpeg|png|webp)", img_url, re.I)
-            ext = ext.group(0).lower() if ext else ".jpg"
-            dest = out_dir / f"{idx:04d}{ext}"
-
-            if dest.exists():
-                print(f"  [{idx:>3}/{len(image_urls)}] Already exists, skipping.")
-                ok_count += 1
-                continue
-
-            success = download_image(img_url, dest, session, referer=url)
-            if success:
-                print(f"  [{idx:>3}/{len(image_urls)}] ✓ {dest.name}")
-                ok_count += 1
-            else:
-                print(f"  [{idx:>3}/{len(image_urls)}] ✗ Failed: {img_url}")
-
-            human_delay()
-
-        print(f"\n  Downloaded {ok_count}/{len(image_urls)} images.")
-
-        if ok_count > 0:
-            build_pdf(out_dir)
-
-        return ok_count == len(image_urls)
+            session.cookies.set(c["name"], c["value"],
+                                domain=c.get("domain", ""))
 
     finally:
         await page.close()
         await context.close()
 
+    # ── Parallel image downloads (CDN — no bot detection) ─────────────────
+    print(f"{prefix} Downloading {len(image_urls)} images "
+          f"({DOWNLOAD_CONCURRENCY} at a time) …")
+
+    sem   = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
+    tasks = []
+    dests = []
+
+    for idx, img_url in enumerate(image_urls, start=1):
+        if img_url.startswith("//"):
+            img_url = "https:" + img_url
+        elif img_url.startswith("/"):
+            p = urlparse(url)
+            img_url = f"{p.scheme}://{p.netloc}{img_url}"
+
+        ext  = (re.search(r"\.(jpg|jpeg|png|webp)", img_url, re.I) or
+                type("m", (), {"group": lambda *_: ".jpg"})()).group(0).lower()
+        dest = out_dir / f"{idx:04d}{ext}"
+        dests.append((idx, len(image_urls), dest))
+
+        if dest.exists():
+            async def _already_done(): return True
+            tasks.append(_already_done())
+        else:
+            tasks.append(download_image(img_url, dest, session, url, sem))
+
+    results = await asyncio.gather(*tasks)
+
+    ok = sum(1 for r in results if r)
+    for (idx, total, dest), success in zip(dests, results):
+        status = "✓" if success else "✗"
+        print(f"  {status} [{idx:>3}/{total}] {dest.name}")
+
+    print(f"\n{prefix} Downloaded {ok}/{len(image_urls)} images.")
+
+    if ok > 0:
+        build_pdf(out_dir)
+
+    return ok == len(image_urls)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main(urls: list[str]) -> None:
-    print("Starting manga scraper …")
-    print(f"Output directory: {OUTPUT_DIR.resolve()}\n")
+    print(f"Starting manga scraper  ({CHAPTER_CONCURRENCY} chapters in parallel, "
+          f"{DOWNLOAD_CONCURRENCY} images/chapter in parallel)")
+    print(f"Output: {OUTPUT_DIR.resolve()}\n")
+
+    urls = [u.strip() for u in urls if u.strip()]
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -312,44 +341,42 @@ async def main(urls: list[str]) -> None:
             ],
         )
 
-        results = {}
-        for url in urls:
-            url = url.strip()
-            if not url:
-                continue
-            success = await scrape_chapter(url, browser)
-            results[url] = success
-            if len(urls) > 1:
-                human_delay(3.0, 6.0)  # pause between chapters
+        # Process chapters in capped-concurrency batches
+        sem      = asyncio.Semaphore(CHAPTER_CONCURRENCY)
+        results  = {}
+
+        async def run_one(url: str, delay: float) -> None:
+            async with sem:
+                results[url] = await scrape_chapter(url, browser,
+                                                    start_delay=delay)
+
+        await asyncio.gather(*[
+            run_one(url, i * random.uniform(*INTER_CHAPTER_DELAY))
+            for i, url in enumerate(urls)
+        ])
 
         await browser.close()
 
     print("\n" + "═" * 60)
     print("Summary:")
     for url, ok in results.items():
-        status = "✓ OK" if ok else "✗ Issues"
-        print(f"  {status}  {url}")
+        print(f"  {'✓ OK  ' if ok else '✗ FAIL'} {url}")
     print("═" * 60)
+    if not all(results.values()):
+        print("\nSome chapters had issues — check the log above.")
 
-    if all(results.values()):
-        print("\nAll chapters downloaded successfully.")
-    else:
-        print("\nSome chapters had issues — check the output above.")
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        target_urls = sys.argv[1:]
-    else:
-        if not Path(URLS_FILE).exists():
-            print(f"No {URLS_FILE} found and no URLs given as arguments.")
-            sys.exit(1)
-        target_urls = [u for u in Path(URLS_FILE).read_text().splitlines() if u.strip()]
-
+    target_urls = (
+        sys.argv[1:]
+        if len(sys.argv) > 1
+        else [u for u in Path(URLS_FILE).read_text().splitlines()
+              if u.strip()]
+        if Path(URLS_FILE).exists()
+        else []
+    )
     if not target_urls:
-        print("No URLs to scrape.")
+        print("No URLs to scrape. Add them to urls.txt or pass as arguments.")
         sys.exit(1)
 
     asyncio.run(main(target_urls))
