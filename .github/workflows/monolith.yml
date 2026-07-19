@@ -1,521 +1,135 @@
-name: Archive Webpage(s) to Single-File HTML
+name: Manga Chapter Scraper
+
 on:
   workflow_dispatch:
     inputs:
-      url:
-        description: "Multiline URLs to archive"
+      urls:
+        description: |
+          Chapter URLs to scrape (one per line).
+          Leave blank to use urls.txt from the repo.
         required: false
         default: ""
-      urls_file:
-        description: "Repo file with one URL per line (used only if it exists)"
-        required: false
-        default: "urls.txt"
       commit_results:
-        description: "Commit the generated HTML files back to this repo"
+        description: "Commit downloaded images + PDFs back to this repo"
         required: true
         default: "false"
         type: choice
         options:
-          - "true"
           - "false"
+          - "true"
 
 permissions:
   contents: write
 
 jobs:
-  prep-urls:
+  scrape:
     runs-on: ubuntu-latest
-    outputs:
-      urls_json: ${{ steps.set-matrix.outputs.urls_json }}
-      count: ${{ steps.set-matrix.outputs.count }}
+    timeout-minutes: 360   # 6 h ceiling — large chapters with stability delays need time
+
     steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Parse URLs
-        id: set-matrix
+      # ── 2. Write override urls.txt if URLs were supplied via the UI ────────
+      - name: Prepare URL list
         env:
-          URL_INPUT: ${{ inputs.url }}
-          URLS_FILE: ${{ inputs.urls_file }}
+          URL_INPUT: ${{ inputs.urls }}
         run: |
-          set -uo pipefail
-          : > urls_to_process.txt
+          set -euo pipefail
           if [ -n "$URL_INPUT" ]; then
-            echo "$URL_INPUT" >> urls_to_process.txt
+            echo "Using URLs from workflow input."
+            printf '%s\n' "$URL_INPUT" > urls.txt
+          elif [ -f urls.txt ]; then
+            echo "Using existing urls.txt from the repo."
+          else
+            echo "::error::No URLs provided and no urls.txt found in the repository."
+            exit 1
           fi
-          if [ -n "$URLS_FILE" ] && [ -f "$URLS_FILE" ]; then
-            cat "$URLS_FILE" >> urls_to_process.txt
-          fi
 
-          # Clean and deduplicate
-          sed -i 's/\r$//' urls_to_process.txt
-          sed -i 's/^[[:space:]]*//; s/[[:space:]]*$//' urls_to_process.txt
-          sed -i '/^[[:space:]]*$/d' urls_to_process.txt
-          awk '!seen[$0]++' urls_to_process.txt > urls_dedup.txt
-          mv urls_dedup.txt urls_to_process.txt
+          # Strip Windows line endings, blank lines, and deduplicate
+          sed -i 's/\r$//' urls.txt
+          awk 'NF && !seen[$0]++' urls.txt > urls_clean.txt
+          mv urls_clean.txt urls.txt
 
-          COUNT=$(wc -l < urls_to_process.txt | tr -d ' ')
-          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "--- URLs to scrape ---"
+          cat urls.txt
+          echo "--- ($(wc -l < urls.txt) URL(s)) ---"
 
-          JSON_ARRAY=$(jq -R -s -c 'split("\n") | map(select(length > 0))' urls_to_process.txt)
-          echo "urls_json=$(echo "$JSON_ARRAY" | base64 -w 0)" >> "$GITHUB_OUTPUT"
-
-  archive:
-    needs: prep-urls
-    runs-on: ubuntu-latest
-    if: ${{ needs.prep-urls.outputs.count != '0' && needs.prep-urls.outputs.count != '' }}
-    name: "Archive URLs Sequentially"
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Decode URLs
-        id: decode
-        run: |
-          echo "${{ needs.prep-urls.outputs.urls_json }}" | base64 -d > urls.json
-          echo "urls_count=$(jq 'length' urls.json)" >> "$GITHUB_OUTPUT"
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      # ── 3. Python setup ────────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          node-version: "20"
+          python-version: "3.13"
+          cache: "pip"
 
-      - name: Write custom archiver script
+      # ── 4. Install Python dependencies ────────────────────────────────────
+      - name: Install Python packages
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/.archiver"
-          cat > "$GITHUB_WORKSPACE/.archiver/archive-page.mjs" << 'ARCHIVER_SCRIPT_EOF'
-          #!/usr/bin/env node
-          // Custom single-file-HTML archiver.
-          // Fetches a page's raw HTML (no JS execution/rendering - see README note),
-          // walks it for asset references (img/link/script/video/audio/inline style/
-          // <style> blocks, plus one level of CSS @import and CSS url()), downloads
-          // each asset and inlines it as a base64 data: URI, then writes one
-          // self-contained .html file.
-          //
-          // Usage: node archive-page.mjs <url> <output-file> [user-agent]
+          pip install --upgrade pip
+          pip install playwright Pillow requests img2pdf
 
-          import { writeFile } from "node:fs/promises";
+      # ── 5. Install Chromium + all system dependencies ─────────────────────
+      #   --with-deps handles libnspr, libgbm, and every other system lib
+      #   automatically on the ubuntu-latest runner.
+      - name: Install Chromium (with system dependencies)
+        run: playwright install --with-deps chromium
 
-          const [, , URL_ARG, OUT_ARG, UA_ARG] = process.argv;
+      # ── 6. Run the scraper ─────────────────────────────────────────────────
+      - name: Run scraper
+        run: python scraper.py
+        # The scraper exits non-zero only on import/parse errors.
+        # Per-chapter failures are reported in stdout but do not abort the run
+        # so all chapters are attempted even if one fails.
 
-          if (!URL_ARG || !OUT_ARG) {
-            console.error("Usage: node archive-page.mjs <url> <output-file> [user-agent]");
-            process.exit(2);
-          }
-
-          const PAGE_URL = URL_ARG;
-          const OUT_FILE = OUT_ARG;
-          const USER_AGENT =
-            UA_ARG ||
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
-
-          const FETCH_TIMEOUT_MS = 20000;
-          const MAX_ASSET_BYTES = 15 * 1024 * 1024; // don't inline anything bigger than this
-          const MAX_CONCURRENT_ASSETS = 6;
-          const MAX_CSS_IMPORT_DEPTH = 3;
-
-          const MIME_BY_EXT = {
-            png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
-            webp: "image/webp", svg: "image/svg+xml", ico: "image/x-icon", bmp: "image/bmp",
-            css: "text/css", js: "text/javascript", mjs: "text/javascript",
-            woff: "font/woff", woff2: "font/woff2", ttf: "font/ttf", otf: "font/otf", eot: "application/vnd.ms-fontobject",
-            mp4: "video/mp4", webm: "video/webm", ogv: "video/ogg",
-            mp3: "audio/mpeg", wav: "audio/wav", oga: "audio/ogg", ogg: "audio/ogg",
-            json: "application/json",
-          };
-
-          function guessMime(url) {
-            const clean = url.split(/[?#]/)[0];
-            const ext = clean.split(".").pop()?.toLowerCase();
-            return MIME_BY_EXT[ext] || "application/octet-stream";
-          }
-
-          function resolveUrl(maybeRelative, base) {
-            try {
-              return new URL(maybeRelative, base).toString();
-            } catch {
-              return null;
-            }
-          }
-
-          async function fetchWithTimeout(url, extraHeaders = {}) {
-            const controller = new AbortController();
-            const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-            try {
-              const res = await fetch(url, {
-                headers: { "User-Agent": USER_AGENT, ...extraHeaders },
-                redirect: "follow",
-                signal: controller.signal,
-              });
-              return res;
-            } finally {
-              clearTimeout(t);
-            }
-          }
-
-          // Simple concurrency-limited map.
-          async function mapLimit(items, limit, fn) {
-            const results = new Array(items.length);
-            let next = 0;
-            async function worker() {
-              while (next < items.length) {
-                const i = next++;
-                results[i] = await fn(items[i], i);
-              }
-            }
-            await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-            return results;
-          }
-
-          const assetCache = new Map(); // absolute url -> data: URI string (or null on failure)
-
-          async function fetchAssetAsDataUri(absUrl) {
-            if (assetCache.has(absUrl)) return assetCache.get(absUrl);
-            try {
-              const res = await fetchWithTimeout(absUrl);
-              if (!res.ok) throw new Error(`HTTP ${res.status}`);
-              const contentType = res.headers.get("content-type")?.split(";")[0]?.trim();
-              const buf = Buffer.from(await res.arrayBuffer());
-              if (buf.length > MAX_ASSET_BYTES) {
-                console.warn(`  skip (too large, ${buf.length}B): ${absUrl}`);
-                assetCache.set(absUrl, null);
-                return null;
-              }
-              const mime = contentType || guessMime(absUrl);
-              const dataUri = `data:${mime};base64,${buf.toString("base64")}`;
-              assetCache.set(absUrl, dataUri);
-              return dataUri;
-            } catch (err) {
-              console.warn(`  failed to fetch asset (${err.message}): ${absUrl}`);
-              assetCache.set(absUrl, null);
-              return null;
-            }
-          }
-
-          // --- CSS handling: url(...) and @import, one level of recursion ---
-
-          async function inlineCss(cssText, baseUrl, depth = 0) {
-            // Splice in @import'd stylesheets first, so their own url()s get rewritten too.
-            const importRe = /@import\s+(?:url\(\s*(['"]?)([^'")]+)\1\s*\)|(['"])([^'"]+)\3)\s*[^;]*;/gi;
-            let matches = [...cssText.matchAll(importRe)];
-            if (depth < MAX_CSS_IMPORT_DEPTH) {
-              for (const m of matches) {
-                const importPath = m[2] || m[4];
-                const absImport = resolveUrl(importPath, baseUrl);
-                if (!absImport) continue;
-                try {
-                  const res = await fetchWithTimeout(absImport);
-                  if (res.ok) {
-                    const importedText = await res.text();
-                    const inlinedImported = await inlineCss(importedText, absImport, depth + 1);
-                    cssText = cssText.replace(m[0], inlinedImported);
-                  } else {
-                    cssText = cssText.replace(m[0], "");
-                  }
-                } catch {
-                  cssText = cssText.replace(m[0], "");
-                }
-              }
-            } else {
-              for (const m of matches) cssText = cssText.replace(m[0], "");
-            }
-
-            // Rewrite url(...) references (background images, fonts, etc).
-            const urlRe = /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi;
-            const urlMatches = [...cssText.matchAll(urlRe)];
-            const uniqueRefs = [...new Set(urlMatches.map((m) => m[2]))].filter(
-              (u) => !u.startsWith("data:")
-            );
-            const resolved = uniqueRefs.map((u) => resolveUrl(u, baseUrl)).filter(Boolean);
-            await mapLimit(resolved, MAX_CONCURRENT_ASSETS, fetchAssetAsDataUri);
-
-            for (const raw of uniqueRefs) {
-              const abs = resolveUrl(raw, baseUrl);
-              const dataUri = abs ? assetCache.get(abs) : null;
-              if (dataUri) {
-                const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-                cssText = cssText.replace(
-                  new RegExp(`url\\(\\s*(['"]?)${escaped}\\1\\s*\\)`, "g"),
-                  `url(${dataUri})`
-                );
-              }
-            }
-            return cssText;
-          }
-
-          // --- HTML handling ---
-
-          function findBaseHref(html, pageUrl) {
-            const m = html.match(/<base\s+[^>]*href=["']([^"']+)["'][^>]*>/i);
-            if (!m) return pageUrl;
-            return resolveUrl(m[1], pageUrl) || pageUrl;
-          }
-
-          async function inlineHtml(html, pageUrl) {
-            const baseUrl = findBaseHref(html, pageUrl);
-
-            // Collect every attribute value we might need to fetch, plus <style> blocks.
-            const jobs = []; // { raw, abs, kind }
-
-            const attrRe = /(src|href)\s*=\s*(["'])(.*?)\2/gi;
-            for (const m of html.matchAll(attrRe)) {
-              const val = m[3];
-              if (!val || val.startsWith("data:") || val.startsWith("#") || val.startsWith("mailto:") || val.startsWith("javascript:")) continue;
-              const abs = resolveUrl(val, baseUrl);
-              if (abs) jobs.push({ raw: val, abs });
-            }
-
-            const srcsetRe = /srcset\s*=\s*(["'])(.*?)\1/gi;
-            const srcsetEntries = [];
-            for (const m of html.matchAll(srcsetRe)) {
-              const parts = m[2].split(",").map((s) => s.trim());
-              for (const part of parts) {
-                const [url] = part.split(/\s+/);
-                if (url && !url.startsWith("data:")) {
-                  const abs = resolveUrl(url, baseUrl);
-                  if (abs) { jobs.push({ raw: url, abs }); srcsetEntries.push(url); }
-                }
-              }
-            }
-
-            const inlineStyleRe = /style\s*=\s*(["'])(.*?)\1/gi;
-            const styleAttrValues = [...html.matchAll(inlineStyleRe)].map((m) => m[2]);
-
-            const styleBlockRe = /<style[^>]*>([\s\S]*?)<\/style>/gi;
-            const styleBlocks = [...html.matchAll(styleBlockRe)];
-
-            // Fetch all plain src/href assets.
-            const uniqueAbs = [...new Set(jobs.map((j) => j.abs))];
-            await mapLimit(uniqueAbs, MAX_CONCURRENT_ASSETS, fetchAssetAsDataUri);
-
-            // Replace <link rel=stylesheet href=...> with the fully inlined CSS.
-            html = await replaceAsync(
-              html,
-              /<link\s+([^>]*rel=["'](?:stylesheet)["'][^>]*)>/gi,
-              async (full, attrs) => {
-                const hrefMatch = attrs.match(/href=["']([^"']+)["']/i);
-                if (!hrefMatch) return full;
-                const abs = resolveUrl(hrefMatch[1], baseUrl);
-                if (!abs) return full;
-                try {
-                  const res = await fetchWithTimeout(abs);
-                  if (!res.ok) return full;
-                  const cssText = await res.text();
-                  const inlined = await inlineCss(cssText, abs);
-                  const b64 = Buffer.from(inlined, "utf8").toString("base64");
-                  return `<link rel="stylesheet" href="data:text/css;base64,${b64}">`;
-                } catch {
-                  return full;
-                }
-              }
-            );
-
-            // Replace icon/apple-touch-icon links, img/script/source/video/audio src+href, and srcset.
-            html = html.replace(attrRe, (full, attr, quote, val) => {
-              if (!val || val.startsWith("data:") || val.startsWith("#") || val.startsWith("mailto:") || val.startsWith("javascript:")) return full;
-              const abs = resolveUrl(val, baseUrl);
-              const dataUri = abs ? assetCache.get(abs) : null;
-              if (dataUri) return `${attr}=${quote}${dataUri}${quote}`;
-              return full;
-            });
-
-            html = html.replace(srcsetRe, (full, quote, val) => {
-              const rewritten = val
-                .split(",")
-                .map((part) => {
-                  const trimmed = part.trim();
-                  const [url, descriptor] = trimmed.split(/\s+/, 2);
-                  if (!url || url.startsWith("data:")) return trimmed;
-                  const abs = resolveUrl(url, baseUrl);
-                  const dataUri = abs ? assetCache.get(abs) : null;
-                  if (dataUri) return descriptor ? `${dataUri} ${descriptor}` : dataUri;
-                  return trimmed;
-                })
-                .join(", ");
-              return `srcset=${quote}${rewritten}${quote}`;
-            });
-
-            // Inline style="" attributes with url(...).
-            for (const styleVal of styleAttrValues) {
-              if (!/url\(/i.test(styleVal)) continue;
-              const inlined = await inlineCss(styleVal, baseUrl);
-              if (inlined !== styleVal) {
-                html = html.replace(
-                  new RegExp(`style=(["'])${escapeRegex(styleVal)}\\1`),
-                  (m, q) => `style=${q}${inlined}${q}`
-                );
-              }
-            }
-
-            // Inline <style>...</style> blocks.
-            for (const block of styleBlocks) {
-              const original = block[1];
-              if (!/url\(/i.test(original)) continue;
-              const inlined = await inlineCss(original, baseUrl);
-              if (inlined !== original) {
-                html = html.replace(block[0], block[0].replace(original, inlined));
-              }
-            }
-
-            return html;
-          }
-
-          function escapeRegex(s) {
-            return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-          }
-
-          async function replaceAsync(str, regex, asyncFn) {
-            const matches = [...str.matchAll(regex)];
-            let result = str;
-            for (const m of matches) {
-              const replacement = await asyncFn(...m);
-              result = result.replace(m[0], replacement);
-            }
-            return result;
-          }
-
-          function isBadResponse(html) {
-            if (!html || html.length < 20) return true;
-            const signatures = [
-              "just a moment", "attention required", "checking your browser",
-              "cf-browser-verification", "please verify you are a human",
-              "enable javascript and cookies to continue", "ddos protection",
-              "access denied", "error 403", "error 429", "ray id", "captcha",
-            ];
-            const head = html.slice(0, 50000).toLowerCase();
-            return signatures.some((s) => head.includes(s));
-          }
-
-          async function main() {
-            const res = await fetchWithTimeout(PAGE_URL);
-            if (!res.ok) throw new Error(`HTTP ${res.status} fetching page`);
-            const html = await res.text();
-            if (isBadResponse(html)) throw new Error("BAD_RESPONSE");
-            const finalHtml = await inlineHtml(html, res.url || PAGE_URL);
-            await writeFile(OUT_FILE, finalHtml, "utf8");
-            console.log(`Wrote ${OUT_FILE} (${finalHtml.length} bytes, ${assetCache.size} assets seen)`);
-          }
-
-          main().catch((err) => {
-            console.error(`ARCHIVE_FAILED: ${err.message}`);
-            process.exit(1);
-          });
-
-          ARCHIVER_SCRIPT_EOF
-
-      - name: Configure system-wide ad/tracker blocking (StevenBlack)
+      # ── 7. List results ────────────────────────────────────────────────────
+      - name: Show download summary
+        if: always()
         run: |
-          echo "Applying StevenBlack hosts file to block ads/trackers at OS level..."
-          curl -sSL https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts | sudo tee -a /etc/hosts > /dev/null
-          echo "Ad/tracker domains blocked."
+          echo "=== Download tree ==="
+          find downloads/ -type f | sort || echo "(nothing downloaded)"
 
-      - name: Archive URLs Sequentially
-        id: archive
-        run: |
-          set -uo pipefail
-          mkdir -p snapshots
-          mapfile -t URLS < <(jq -r '.[]' urls.json)
-          TOTAL=${#URLS[@]}
-          echo "Total URLs to process: $TOTAL"
-
-          SUCCESS_COUNT=0
-          FAIL_COUNT=0
-          # Polite baseline delay + jitter - one page at a time, on purpose.
-          BASE_DELAY=5
-
-          UAS=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/137.0"
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:137.0) Gecko/20100101 Firefox/137.0"
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
-          )
-
-          for i in "${!URLS[@]}"; do
-            URL="${URLS[$i]}"
-            UA="${UAS[$(( RANDOM % ${#UAS[@]} ))]}"
-            output_file="snapshots/url_${i}.html"
-
-            echo "================================================================"
-            echo "Processing [url_${i}]: $URL"
-
-            JITTER=$(( RANDOM % 4 ))
-            ACTUAL_DELAY=$(( BASE_DELAY + JITTER ))
-            echo "Waiting ${ACTUAL_DELAY}s before request..."
-            sleep "$ACTUAL_DELAY"
-
-            SUCCESS=false
-            ATTEMPT=1
-            MAX_ATTEMPTS=5
-            CURRENT_DELAY=$BASE_DELAY
-
-            while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
-              echo "Attempt $ATTEMPT of $MAX_ATTEMPTS for $URL"
-
-              if node "$GITHUB_WORKSPACE/.archiver/archive-page.mjs" "$URL" "$output_file" "$UA"; then
-                SUCCESS=true
-                echo "Successfully archived $URL -> $output_file"
-                CURRENT_DELAY=$BASE_DELAY
-                break
-              else
-                echo "Archiver failed for $URL"
-                ATTEMPT=$((ATTEMPT + 1))
-                CURRENT_DELAY=$(( CURRENT_DELAY * 2 ))
-                [ $CURRENT_DELAY -gt 30 ] && CURRENT_DELAY=30
-                if [ $ATTEMPT -le $MAX_ATTEMPTS ]; then
-                  echo "Backing off: Waiting ${CURRENT_DELAY}s before retry..."
-                  sleep "$CURRENT_DELAY"
-                fi
-              fi
-            done
-
-            if [ "$SUCCESS" = "true" ]; then
-              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-            else
-              FAIL_COUNT=$((FAIL_COUNT + 1))
-              echo "::warning::Failed to archive after $MAX_ATTEMPTS attempts: $URL"
-            fi
-          done
-
-          echo "archive_success_count=$SUCCESS_COUNT" >> "$GITHUB_OUTPUT"
-          echo "archive_fail_count=$FAIL_COUNT" >> "$GITHUB_OUTPUT"
-          echo "================================================================"
-          echo "ARCHIVE SUMMARY: $SUCCESS_COUNT succeeded, $FAIL_COUNT failed out of $TOTAL"
-          echo "================================================================"
-          exit 0
-
-      - name: Upload Archive Artifacts
+      # ── 8. Upload artifact ─────────────────────────────────────────────────
+      - name: Upload downloaded chapters
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: all-snapshots
-          path: snapshots/
-          retention-days: 5
+          name: manga-chapters
+          path: downloads/
+          retention-days: 30
           if-no-files-found: warn
 
-      - name: Commit and Push Changes
+      # ── 9. Optional: commit results back to the repo ───────────────────────
+      - name: Commit downloaded chapters to repo
         if: ${{ inputs.commit_results == 'true' }}
         run: |
-          set -uo pipefail
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add snapshots/
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Make sure downloads/ is tracked (it is in .gitignore locally,
+          # but we intentionally add it here when commit_results is true).
+          git add -f downloads/
+
           if git diff --cached --quiet; then
-            echo "No changes to commit."
+            echo "No new files to commit."
             exit 0
           fi
-          git commit -m "chore: add snapshot archives [skip ci]"
-          TARGET_BRANCH="${{ github.ref_name }}"
+
+          CHAPTER_COUNT=$(find downloads/ -name "chapter.pdf" | wc -l | tr -d ' ')
+          git commit -m "chore: add $CHAPTER_COUNT scraped chapter(s) [skip ci]"
+
+          # Retry push with rebase in case of concurrent commits
           for attempt in 1 2 3; do
-            git fetch origin "$TARGET_BRANCH"
-            if git rebase origin/"$TARGET_BRANCH" && git push origin HEAD:"$TARGET_BRANCH"; then
-              echo "Successfully pushed changes."
+            git fetch origin "${{ github.ref_name }}"
+            if git rebase "origin/${{ github.ref_name }}" && \
+               git push origin "HEAD:${{ github.ref_name }}"; then
+              echo "Pushed successfully on attempt $attempt."
               exit 0
-            else
-              echo "Push failed, attempt $attempt. Retrying..."
-              git rebase --abort || true
             fi
-            sleep $(( 2 + RANDOM % 3 ))
+            git rebase --abort 2>/dev/null || true
+            sleep $(( 3 + RANDOM % 4 ))
           done
-          echo "::warning::Failed to push changes after 3 attempts."
+
+          echo "::warning::Could not push after 3 attempts — the artifact still has your files."
           exit 0
