@@ -10,10 +10,6 @@ on:
         description: "Repo file with one URL per line (used only if it exists)"
         required: false
         default: "urls.txt"
-      parallelism:
-        description: "Number of parallel archive jobs (shards, 1-10)"
-        required: false
-        default: "3"
       commit_results:
         description: "Commit the generated HTML files back to this repo"
         required: true
@@ -30,18 +26,17 @@ jobs:
   prep-urls:
     runs-on: ubuntu-latest
     outputs:
-      shard_json: ${{ steps.set-matrix.outputs.shard_json }}
-      shard_count: ${{ steps.set-matrix.outputs.shard_count }}
+      urls_json: ${{ steps.set-matrix.outputs.urls_json }}
+      count: ${{ steps.set-matrix.outputs.count }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Parse and shard URLs by domain
+      - name: Parse URLs
         id: set-matrix
         env:
           URL_INPUT: ${{ inputs.url }}
           URLS_FILE: ${{ inputs.urls_file }}
-          PARALLELISM: ${{ inputs.parallelism }}
         run: |
           set -uo pipefail
           : > urls_to_process.txt
@@ -59,90 +54,354 @@ jobs:
           awk '!seen[$0]++' urls_to_process.txt > urls_dedup.txt
           mv urls_dedup.txt urls_to_process.txt
 
-          TOTAL=$(wc -l < urls_to_process.txt | tr -d ' ')
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "shard_json=[]" >> "$GITHUB_OUTPUT"
-            echo "shard_count=0" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          COUNT=$(wc -l < urls_to_process.txt | tr -d ' ')
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
 
-          # Sanitize parallelism input and keep it within sane bounds.
-          P="${PARALLELISM:-3}"
-          case "$P" in (''|*[!0-9]*) P=3 ;; esac
-          [ "$P" -lt 1 ] && P=1
-          [ "$P" -gt "$TOTAL" ] && P=$TOTAL
-          [ "$P" -gt 10 ] && P=10   # cap: this is about throughput, not scale-evasion
-
-          mkdir -p shards
-          # Group by domain so every URL for a given host lands in the same shard.
-          # Keeps the per-request delay/backoff meaningful instead of letting
-          # several shards hit the same site at the same moment.
-          while IFS= read -r url; do
-            domain=$(printf '%s' "$url" | sed -E 's|^[a-zA-Z][a-zA-Z0-9+.-]*://||; s|[/?#].*||; s/:.*//')
-            shard=$(( $(printf '%s' "$domain" | cksum | cut -d' ' -f1) % P ))
-            echo "$url" >> "shards/shard_${shard}.txt"
-          done < urls_to_process.txt
-
-          ACTIVE_SHARDS="[]"
-          for i in $(seq 0 $((P - 1))); do
-            if [ -s "shards/shard_${i}.txt" ]; then
-              ACTIVE_SHARDS=$(echo "$ACTIVE_SHARDS" | jq -c ". + [$i]")
-            fi
-          done
-
-          echo "shard_json=$ACTIVE_SHARDS" >> "$GITHUB_OUTPUT"
-          echo "shard_count=$(echo "$ACTIVE_SHARDS" | jq 'length')" >> "$GITHUB_OUTPUT"
-
-      - name: Upload sharded URL lists
-        uses: actions/upload-artifact@v4
-        with:
-          name: shard-inputs
-          path: shards/
-          retention-days: 1
+          JSON_ARRAY=$(jq -R -s -c 'split("\n") | map(select(length > 0))' urls_to_process.txt)
+          echo "urls_json=$(echo "$JSON_ARRAY" | base64 -w 0)" >> "$GITHUB_OUTPUT"
 
   archive:
     needs: prep-urls
-    if: ${{ needs.prep-urls.outputs.shard_count != '0' }}
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: ${{ fromJson(needs.prep-urls.outputs.shard_json) }}
-    name: "Archive shard ${{ matrix.shard }}"
+    if: ${{ needs.prep-urls.outputs.count != '0' && needs.prep-urls.outputs.count != '' }}
+    name: "Archive URLs Sequentially"
     steps:
-      - name: Download sharded URL list
-        uses: actions/download-artifact@v4
-        with:
-          name: shard-inputs
-          path: shards
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Decode URLs
+        id: decode
+        run: |
+          echo "${{ needs.prep-urls.outputs.urls_json }}" | base64 -d > urls.json
+          echo "urls_count=$(jq 'length' urls.json)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Cache single-file-cli install
-        id: cache-sf
-        uses: actions/cache@v4
-        with:
-          path: |
-            /opt/single-file-cli
-            ~/.cache/puppeteer
-          key: singlefile-cli-${{ runner.os }}-v3
-
-      - name: Install single-file-cli and Chromium
-        if: steps.cache-sf.outputs.cache-hit != 'true'
+      - name: Write custom archiver script
         run: |
-          set -uo pipefail
-          mkdir -p /opt/single-file-cli
-          cd /opt/single-file-cli
-          npm init -y >/dev/null
-          npm install --no-audit --no-fund "single-file-cli@^2.0.0" "puppeteer@^23.0.0" >/dev/null
-          npx puppeteer browsers install chrome >/dev/null 2>&1 || true
-          # single-file-cli publishes its binary at node_modules/.bin/single-file -
-          # the old node_modules/single-file-cli/single-file-node.js path doesn't exist.
-          test -f /opt/single-file-cli/node_modules/.bin/single-file \
-            || { echo "::error::single-file binary not found after install"; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/.archiver"
+          cat > "$GITHUB_WORKSPACE/.archiver/archive-page.mjs" << 'ARCHIVER_SCRIPT_EOF'
+          #!/usr/bin/env node
+          // Custom single-file-HTML archiver.
+          // Fetches a page's raw HTML (no JS execution/rendering - see README note),
+          // walks it for asset references (img/link/script/video/audio/inline style/
+          // <style> blocks, plus one level of CSS @import and CSS url()), downloads
+          // each asset and inlines it as a base64 data: URI, then writes one
+          // self-contained .html file.
+          //
+          // Usage: node archive-page.mjs <url> <output-file> [user-agent]
+
+          import { writeFile } from "node:fs/promises";
+
+          const [, , URL_ARG, OUT_ARG, UA_ARG] = process.argv;
+
+          if (!URL_ARG || !OUT_ARG) {
+            console.error("Usage: node archive-page.mjs <url> <output-file> [user-agent]");
+            process.exit(2);
+          }
+
+          const PAGE_URL = URL_ARG;
+          const OUT_FILE = OUT_ARG;
+          const USER_AGENT =
+            UA_ARG ||
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
+
+          const FETCH_TIMEOUT_MS = 20000;
+          const MAX_ASSET_BYTES = 15 * 1024 * 1024; // don't inline anything bigger than this
+          const MAX_CONCURRENT_ASSETS = 6;
+          const MAX_CSS_IMPORT_DEPTH = 3;
+
+          const MIME_BY_EXT = {
+            png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
+            webp: "image/webp", svg: "image/svg+xml", ico: "image/x-icon", bmp: "image/bmp",
+            css: "text/css", js: "text/javascript", mjs: "text/javascript",
+            woff: "font/woff", woff2: "font/woff2", ttf: "font/ttf", otf: "font/otf", eot: "application/vnd.ms-fontobject",
+            mp4: "video/mp4", webm: "video/webm", ogv: "video/ogg",
+            mp3: "audio/mpeg", wav: "audio/wav", oga: "audio/ogg", ogg: "audio/ogg",
+            json: "application/json",
+          };
+
+          function guessMime(url) {
+            const clean = url.split(/[?#]/)[0];
+            const ext = clean.split(".").pop()?.toLowerCase();
+            return MIME_BY_EXT[ext] || "application/octet-stream";
+          }
+
+          function resolveUrl(maybeRelative, base) {
+            try {
+              return new URL(maybeRelative, base).toString();
+            } catch {
+              return null;
+            }
+          }
+
+          async function fetchWithTimeout(url, extraHeaders = {}) {
+            const controller = new AbortController();
+            const t = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+            try {
+              const res = await fetch(url, {
+                headers: { "User-Agent": USER_AGENT, ...extraHeaders },
+                redirect: "follow",
+                signal: controller.signal,
+              });
+              return res;
+            } finally {
+              clearTimeout(t);
+            }
+          }
+
+          // Simple concurrency-limited map.
+          async function mapLimit(items, limit, fn) {
+            const results = new Array(items.length);
+            let next = 0;
+            async function worker() {
+              while (next < items.length) {
+                const i = next++;
+                results[i] = await fn(items[i], i);
+              }
+            }
+            await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+            return results;
+          }
+
+          const assetCache = new Map(); // absolute url -> data: URI string (or null on failure)
+
+          async function fetchAssetAsDataUri(absUrl) {
+            if (assetCache.has(absUrl)) return assetCache.get(absUrl);
+            try {
+              const res = await fetchWithTimeout(absUrl);
+              if (!res.ok) throw new Error(`HTTP ${res.status}`);
+              const contentType = res.headers.get("content-type")?.split(";")[0]?.trim();
+              const buf = Buffer.from(await res.arrayBuffer());
+              if (buf.length > MAX_ASSET_BYTES) {
+                console.warn(`  skip (too large, ${buf.length}B): ${absUrl}`);
+                assetCache.set(absUrl, null);
+                return null;
+              }
+              const mime = contentType || guessMime(absUrl);
+              const dataUri = `data:${mime};base64,${buf.toString("base64")}`;
+              assetCache.set(absUrl, dataUri);
+              return dataUri;
+            } catch (err) {
+              console.warn(`  failed to fetch asset (${err.message}): ${absUrl}`);
+              assetCache.set(absUrl, null);
+              return null;
+            }
+          }
+
+          // --- CSS handling: url(...) and @import, one level of recursion ---
+
+          async function inlineCss(cssText, baseUrl, depth = 0) {
+            // Splice in @import'd stylesheets first, so their own url()s get rewritten too.
+            const importRe = /@import\s+(?:url\(\s*(['"]?)([^'")]+)\1\s*\)|(['"])([^'"]+)\3)\s*[^;]*;/gi;
+            let matches = [...cssText.matchAll(importRe)];
+            if (depth < MAX_CSS_IMPORT_DEPTH) {
+              for (const m of matches) {
+                const importPath = m[2] || m[4];
+                const absImport = resolveUrl(importPath, baseUrl);
+                if (!absImport) continue;
+                try {
+                  const res = await fetchWithTimeout(absImport);
+                  if (res.ok) {
+                    const importedText = await res.text();
+                    const inlinedImported = await inlineCss(importedText, absImport, depth + 1);
+                    cssText = cssText.replace(m[0], inlinedImported);
+                  } else {
+                    cssText = cssText.replace(m[0], "");
+                  }
+                } catch {
+                  cssText = cssText.replace(m[0], "");
+                }
+              }
+            } else {
+              for (const m of matches) cssText = cssText.replace(m[0], "");
+            }
+
+            // Rewrite url(...) references (background images, fonts, etc).
+            const urlRe = /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi;
+            const urlMatches = [...cssText.matchAll(urlRe)];
+            const uniqueRefs = [...new Set(urlMatches.map((m) => m[2]))].filter(
+              (u) => !u.startsWith("data:")
+            );
+            const resolved = uniqueRefs.map((u) => resolveUrl(u, baseUrl)).filter(Boolean);
+            await mapLimit(resolved, MAX_CONCURRENT_ASSETS, fetchAssetAsDataUri);
+
+            for (const raw of uniqueRefs) {
+              const abs = resolveUrl(raw, baseUrl);
+              const dataUri = abs ? assetCache.get(abs) : null;
+              if (dataUri) {
+                const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                cssText = cssText.replace(
+                  new RegExp(`url\\(\\s*(['"]?)${escaped}\\1\\s*\\)`, "g"),
+                  `url(${dataUri})`
+                );
+              }
+            }
+            return cssText;
+          }
+
+          // --- HTML handling ---
+
+          function findBaseHref(html, pageUrl) {
+            const m = html.match(/<base\s+[^>]*href=["']([^"']+)["'][^>]*>/i);
+            if (!m) return pageUrl;
+            return resolveUrl(m[1], pageUrl) || pageUrl;
+          }
+
+          async function inlineHtml(html, pageUrl) {
+            const baseUrl = findBaseHref(html, pageUrl);
+
+            // Collect every attribute value we might need to fetch, plus <style> blocks.
+            const jobs = []; // { raw, abs, kind }
+
+            const attrRe = /(src|href)\s*=\s*(["'])(.*?)\2/gi;
+            for (const m of html.matchAll(attrRe)) {
+              const val = m[3];
+              if (!val || val.startsWith("data:") || val.startsWith("#") || val.startsWith("mailto:") || val.startsWith("javascript:")) continue;
+              const abs = resolveUrl(val, baseUrl);
+              if (abs) jobs.push({ raw: val, abs });
+            }
+
+            const srcsetRe = /srcset\s*=\s*(["'])(.*?)\1/gi;
+            const srcsetEntries = [];
+            for (const m of html.matchAll(srcsetRe)) {
+              const parts = m[2].split(",").map((s) => s.trim());
+              for (const part of parts) {
+                const [url] = part.split(/\s+/);
+                if (url && !url.startsWith("data:")) {
+                  const abs = resolveUrl(url, baseUrl);
+                  if (abs) { jobs.push({ raw: url, abs }); srcsetEntries.push(url); }
+                }
+              }
+            }
+
+            const inlineStyleRe = /style\s*=\s*(["'])(.*?)\1/gi;
+            const styleAttrValues = [...html.matchAll(inlineStyleRe)].map((m) => m[2]);
+
+            const styleBlockRe = /<style[^>]*>([\s\S]*?)<\/style>/gi;
+            const styleBlocks = [...html.matchAll(styleBlockRe)];
+
+            // Fetch all plain src/href assets.
+            const uniqueAbs = [...new Set(jobs.map((j) => j.abs))];
+            await mapLimit(uniqueAbs, MAX_CONCURRENT_ASSETS, fetchAssetAsDataUri);
+
+            // Replace <link rel=stylesheet href=...> with the fully inlined CSS.
+            html = await replaceAsync(
+              html,
+              /<link\s+([^>]*rel=["'](?:stylesheet)["'][^>]*)>/gi,
+              async (full, attrs) => {
+                const hrefMatch = attrs.match(/href=["']([^"']+)["']/i);
+                if (!hrefMatch) return full;
+                const abs = resolveUrl(hrefMatch[1], baseUrl);
+                if (!abs) return full;
+                try {
+                  const res = await fetchWithTimeout(abs);
+                  if (!res.ok) return full;
+                  const cssText = await res.text();
+                  const inlined = await inlineCss(cssText, abs);
+                  const b64 = Buffer.from(inlined, "utf8").toString("base64");
+                  return `<link rel="stylesheet" href="data:text/css;base64,${b64}">`;
+                } catch {
+                  return full;
+                }
+              }
+            );
+
+            // Replace icon/apple-touch-icon links, img/script/source/video/audio src+href, and srcset.
+            html = html.replace(attrRe, (full, attr, quote, val) => {
+              if (!val || val.startsWith("data:") || val.startsWith("#") || val.startsWith("mailto:") || val.startsWith("javascript:")) return full;
+              const abs = resolveUrl(val, baseUrl);
+              const dataUri = abs ? assetCache.get(abs) : null;
+              if (dataUri) return `${attr}=${quote}${dataUri}${quote}`;
+              return full;
+            });
+
+            html = html.replace(srcsetRe, (full, quote, val) => {
+              const rewritten = val
+                .split(",")
+                .map((part) => {
+                  const trimmed = part.trim();
+                  const [url, descriptor] = trimmed.split(/\s+/, 2);
+                  if (!url || url.startsWith("data:")) return trimmed;
+                  const abs = resolveUrl(url, baseUrl);
+                  const dataUri = abs ? assetCache.get(abs) : null;
+                  if (dataUri) return descriptor ? `${dataUri} ${descriptor}` : dataUri;
+                  return trimmed;
+                })
+                .join(", ");
+              return `srcset=${quote}${rewritten}${quote}`;
+            });
+
+            // Inline style="" attributes with url(...).
+            for (const styleVal of styleAttrValues) {
+              if (!/url\(/i.test(styleVal)) continue;
+              const inlined = await inlineCss(styleVal, baseUrl);
+              if (inlined !== styleVal) {
+                html = html.replace(
+                  new RegExp(`style=(["'])${escapeRegex(styleVal)}\\1`),
+                  (m, q) => `style=${q}${inlined}${q}`
+                );
+              }
+            }
+
+            // Inline <style>...</style> blocks.
+            for (const block of styleBlocks) {
+              const original = block[1];
+              if (!/url\(/i.test(original)) continue;
+              const inlined = await inlineCss(original, baseUrl);
+              if (inlined !== original) {
+                html = html.replace(block[0], block[0].replace(original, inlined));
+              }
+            }
+
+            return html;
+          }
+
+          function escapeRegex(s) {
+            return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          }
+
+          async function replaceAsync(str, regex, asyncFn) {
+            const matches = [...str.matchAll(regex)];
+            let result = str;
+            for (const m of matches) {
+              const replacement = await asyncFn(...m);
+              result = result.replace(m[0], replacement);
+            }
+            return result;
+          }
+
+          function isBadResponse(html) {
+            if (!html || html.length < 20) return true;
+            const signatures = [
+              "just a moment", "attention required", "checking your browser",
+              "cf-browser-verification", "please verify you are a human",
+              "enable javascript and cookies to continue", "ddos protection",
+              "access denied", "error 403", "error 429", "ray id", "captcha",
+            ];
+            const head = html.slice(0, 50000).toLowerCase();
+            return signatures.some((s) => head.includes(s));
+          }
+
+          async function main() {
+            const res = await fetchWithTimeout(PAGE_URL);
+            if (!res.ok) throw new Error(`HTTP ${res.status} fetching page`);
+            const html = await res.text();
+            if (isBadResponse(html)) throw new Error("BAD_RESPONSE");
+            const finalHtml = await inlineHtml(html, res.url || PAGE_URL);
+            await writeFile(OUT_FILE, finalHtml, "utf8");
+            console.log(`Wrote ${OUT_FILE} (${finalHtml.length} bytes, ${assetCache.size} assets seen)`);
+          }
+
+          main().catch((err) => {
+            console.error(`ARCHIVE_FAILED: ${err.message}`);
+            process.exit(1);
+          });
+
+          ARCHIVER_SCRIPT_EOF
 
       - name: Configure system-wide ad/tracker blocking (StevenBlack)
         run: |
@@ -150,22 +409,20 @@ jobs:
           curl -sSL https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts | sudo tee -a /etc/hosts > /dev/null
           echo "Ad/tracker domains blocked."
 
-      - name: Archive this shard's URLs
+      - name: Archive URLs Sequentially
         id: archive
         run: |
           set -uo pipefail
           mkdir -p snapshots
-          SHARD_FILE="shards/shard_${{ matrix.shard }}.txt"
-          mapfile -t URLS < "$SHARD_FILE"
+          mapfile -t URLS < <(jq -r '.[]' urls.json)
           TOTAL=${#URLS[@]}
-          echo "Shard ${{ matrix.shard }}: $TOTAL URL(s)"
+          echo "Total URLs to process: $TOTAL"
 
           SUCCESS_COUNT=0
           FAIL_COUNT=0
-          # Polite baseline delay + jitter - prioritize stability over speed.
+          # Polite baseline delay + jitter - one page at a time, on purpose.
           BASE_DELAY=5
 
-          # Ordinary desktop browser strings only.
           UAS=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
@@ -174,27 +431,13 @@ jobs:
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
           )
 
-          SF="/opt/single-file-cli/node_modules/.bin/single-file"
-          CHROME_PATH="$(find ~/.cache/puppeteer -name chrome -type f 2>/dev/null | head -1)"
-
-          # Optimized check: read only the first 50KB to detect blocks/empty pages
-          is_bad_response() {
-            local f="$1"
-            [ ! -s "$f" ] && return 0
-            if head -c 50000 "$f" | grep -qiE 'just a moment|attention required|checking your browser|cf-browser-verification|please verify you are a human|enable javascript and cookies to continue|ddos protection|access denied|error 403|error 429|ray id|captcha' >/dev/null 2>&1; then
-              return 0
-            fi
-            return 1
-          }
-
           for i in "${!URLS[@]}"; do
             URL="${URLS[$i]}"
             UA="${UAS[$(( RANDOM % ${#UAS[@]} ))]}"
-            SAFE_NAME=$(printf '%s' "$URL" | md5sum | cut -d' ' -f1)
-            output_file="snapshots/${SAFE_NAME}.html"
+            output_file="snapshots/url_${i}.html"
 
             echo "================================================================"
-            echo "Processing: $URL"
+            echo "Processing [url_${i}]: $URL"
 
             JITTER=$(( RANDOM % 4 ))
             ACTUAL_DELAY=$(( BASE_DELAY + JITTER ))
@@ -209,31 +452,13 @@ jobs:
             while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
               echo "Attempt $ATTEMPT of $MAX_ATTEMPTS for $URL"
 
-              if timeout 180s "$SF" \
-                  --browser-headless=true \
-                  --browser-executable-path="${CHROME_PATH:-chrome}" \
-                  --user-agent="$UA" \
-                  --load-deferred-images=true \
-                  --remove-hidden-elements=true \
-                  --compress-css=true \
-                  "$URL" "$output_file" 2> "/tmp/sf_err.log"; then
-
-                if [ -s "$output_file" ] && ! is_bad_response "$output_file"; then
-                  SUCCESS=true
-                else
-                  echo "single-file produced a bad/empty result; will retry."
-                  tail -n 20 "/tmp/sf_err.log" || true
-                fi
-              else
-                echo "single-file exited non-zero / timed out."
-                tail -n 20 "/tmp/sf_err.log" || true
-              fi
-
-              if [ "$SUCCESS" = "true" ]; then
+              if node "$GITHUB_WORKSPACE/.archiver/archive-page.mjs" "$URL" "$output_file" "$UA"; then
+                SUCCESS=true
                 echo "Successfully archived $URL -> $output_file"
                 CURRENT_DELAY=$BASE_DELAY
                 break
               else
+                echo "Archiver failed for $URL"
                 ATTEMPT=$((ATTEMPT + 1))
                 CURRENT_DELAY=$(( CURRENT_DELAY * 2 ))
                 [ $CURRENT_DELAY -gt 30 ] && CURRENT_DELAY=30
@@ -255,35 +480,21 @@ jobs:
           echo "archive_success_count=$SUCCESS_COUNT" >> "$GITHUB_OUTPUT"
           echo "archive_fail_count=$FAIL_COUNT" >> "$GITHUB_OUTPUT"
           echo "================================================================"
-          echo "SHARD ${{ matrix.shard }} SUMMARY: $SUCCESS_COUNT succeeded, $FAIL_COUNT failed out of $TOTAL"
+          echo "ARCHIVE SUMMARY: $SUCCESS_COUNT succeeded, $FAIL_COUNT failed out of $TOTAL"
           echo "================================================================"
           exit 0
 
-      - name: Upload this shard's snapshots
+      - name: Upload Archive Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: snapshots-shard-${{ matrix.shard }}
+          name: all-snapshots
           path: snapshots/
           retention-days: 5
           if-no-files-found: warn
 
-  commit:
-    needs: archive
-    if: ${{ always() && needs.archive.result != 'skipped' && inputs.commit_results == 'true' }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download all snapshot shards
-        uses: actions/download-artifact@v4
-        with:
-          pattern: snapshots-shard-*
-          path: snapshots
-          merge-multiple: true
-
       - name: Commit and Push Changes
+        if: ${{ inputs.commit_results == 'true' }}
         run: |
           set -uo pipefail
           git config --global user.name "github-actions[bot]"
