@@ -5,7 +5,7 @@ Manga Chapter Scraper
 Uses a real Chromium browser (via Playwright) to bypass DDoS / bot-detection
 protections (Cloudflare, etc.) and downloads manga chapter images in order.
 
-Output: one folder per chapter containing numbered images + a combined PDF.
+Output: A single combined PDF file per chapter (image files are cleaned up after assembly).
 
 Speed design
 ------------
@@ -106,13 +106,7 @@ IMAGE_SELECTORS = [
 
 
 async def find_images(page) -> list[str]:
-    """Return ordered, de-duplicated list of manga-page image URLs.
-
-    Dimension filtering only fires when the image has *actually loaded*
-    (naturalWidth > 0). Lazy-loaded placeholders have naturalWidth=0 but a
-    tiny CSS height (e.g. 16 px) — using i.height instead of naturalHeight
-    would incorrectly discard every manga page on sites like ManhuaPlus.
-    """
+    """Return ordered, de-duplicated list of manga-page image URLs."""
     MIN_W, MIN_H = 300, 200
 
     for selector in IMAGE_SELECTORS:
@@ -121,14 +115,18 @@ async def find_images(page) -> list[str]:
                 const imgs = Array.from(document.querySelectorAll(sel));
                 const out  = [];
                 for (const i of imgs) {
-                    const src = i.dataset.src || i.dataset.lazySrc
+                    let src = i.dataset.src || i.dataset.lazySrc
                                 || i.dataset.original || i.getAttribute('src') || '';
                     if (!src || src.startsWith('data:') || src.length < 10) continue;
                     if (!/\\.(jpg|jpeg|png|webp)(\\?.*)?$/i.test(src)) continue;
-                    // Only apply size filter when the browser has actually loaded
-                    // the image (naturalWidth > 0). Unloaded lazy images report
-                    // naturalWidth=0 — we must keep those; the URL regex above
-                    // already weeds out obvious non-image assets.
+
+                    // Resolve relative/protocol-relative URLs into absolute URLs
+                    try {
+                        src = new URL(src, window.location.href).href;
+                    } catch (e) {
+                        continue;
+                    }
+
                     const nw = i.naturalWidth;
                     const nh = i.naturalHeight;
                     if (nw > 0 && nw < minW) continue;
@@ -179,26 +177,30 @@ async def download_image(url: str, dest: Path, session: requests.Session,
         return await asyncio.to_thread(_download_blocking, url, dest, session, referer)
 
 
-# ── PDF builder ───────────────────────────────────────────────────────────────
+# ── PDF builder & Cleanup ─────────────────────────────────────────────────────
 
 def build_pdf(chapter_path: Path) -> Path | None:
-    images = sorted(
+    raw_images = sorted(
         set(chapter_path.glob("*.jpg")) |
         set(chapter_path.glob("*.png")) |
         set(chapter_path.glob("*.webp")),
         key=lambda p: int(m.group(1)) if (m := re.search(r"(\d+)", p.stem)) else 0,
     )
-    if not images:
+    if not raw_images:
         print("  No images to bundle into PDF.")
         return None
 
     converted = []
-    for p in images:
+    temp_files = set(raw_images)
+
+    # Convert WebP images to JPEG for img2pdf compatibility
+    for p in raw_images:
         if p.suffix.lower() == ".webp":
             jpg = p.with_suffix(".jpg")
             with Image.open(p) as im:
                 im.convert("RGB").save(jpg, "JPEG", quality=95)
             converted.append(jpg)
+            temp_files.add(jpg)
         else:
             converted.append(p)
 
@@ -207,6 +209,16 @@ def build_pdf(chapter_path: Path) -> Path | None:
         f.write(img2pdf.convert([str(p) for p in converted]))
 
     print(f"  PDF saved → {pdf_path}  ({len(converted)} pages)")
+
+    # ── Clean up individual image files after PDF creation ────────────────────
+    print("  Cleaning up temporary image files...")
+    for img_file in temp_files:
+        try:
+            if img_file.exists():
+                img_file.unlink()
+        except Exception as e:
+            print(f"    Warning: Could not delete {img_file.name}: {e}")
+
     return pdf_path
 
 
